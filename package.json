@@ -1,0 +1,29 @@
+{
+  "name": "guitar-mate",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "predev": "node scripts/copy-model.mjs && node scripts/gen-sw.mjs",
+    "dev": "vite",
+    "prebuild": "node scripts/copy-model.mjs && node scripts/gen-sw.mjs",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "host": "npm run build && vite preview --host --port 4173",
+    "serve:subpath": "node scripts/serve-subpath.mjs",
+    "icons": "node scripts/gen-icons.mjs",
+    "test": "node scripts/run-tests.mjs"
+  },
+  "dependencies": {
+    "@spotify/basic-pitch": "^1.0.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.2",
+    "typescript": "~5.6.2",
+    "vite": "^5.4.8"
+  }
+}
