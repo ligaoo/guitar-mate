@@ -65,6 +65,8 @@ export default function TranscribePage() {
   const [abPlaying, setAbPlaying] = useState(false)
   const dirtyRef = useRef(false) // 有手工编辑时,参数变化不再自动重建
   const shiftRef = useRef(0) // 量化时的整体归一偏移(谱面 step ↔ 原音频时间的换算)
+  const autoSaveRef = useRef(false) // 识别成功后自动保存到曲库
+  const autoNameRef = useRef('')
   const abTimerRef = useRef(0)
 
   const recRef = useRef<MicRecorder | null>(null)
@@ -261,6 +263,8 @@ export default function TranscribePage() {
         setResult(r)
         setRawNotes(r.notes)
         setBpm(refineBpm(r.notes.map((n) => n.start), r.bpm))
+        autoSaveRef.current = true
+        autoNameRef.current = fileName.replace(/\(\d+(\.\d+)?s\)$/, '').trim() || '识别结果'
         setVisibleBars(8)
         setStatus('done')
       } catch (e) {
@@ -296,6 +300,8 @@ export default function TranscribePage() {
         setResult(r)
         setRawNotes(r.notes)
         setBpm(refineBpm(r.notes.map((n) => n.start), r.bpm))
+        autoSaveRef.current = true
+        autoNameRef.current = fileName.replace(/\(\d+(\.\d+)?s\)$/, '').trim() || '识别结果'
         setVisibleBars(8)
         setStatus('done')
       } else if (e.data.type === 'error') {
@@ -367,6 +373,11 @@ export default function TranscribePage() {
     setSelectedId(null)
     dirtyRef.current = false
     setStaleParams(false)
+    // 识别成功后的第一次重建 → 自动保存到曲库(同名覆盖),刷新/切页不再丢结果
+    if (autoSaveRef.current) {
+      autoSaveRef.current = false
+      setSongs(saveSong(autoNameRef.current, bpm, tuningId, tab, SUBDIV))
+    }
   }
 
   // 参数变化:无手工编辑 → 自动重建;有手工编辑 → 仅标记过期,等用户确认(不再静默丢弃编辑)
@@ -751,8 +762,9 @@ export default function TranscribePage() {
           <div className="chip-row">
             {songs.map((s) => (
               <span key={s.id} className={`chip${loadedSongName === s.name ? ' active' : ''}`} style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
-                <span style={{ cursor: 'pointer' }} onClick={() => loadSong(s)} title={`${s.bpm} BPM · ${s.notes.length} 音符 · 点击加载`}>
-                  {s.name} · {s.bpm}bpm
+                <span style={{ cursor: 'pointer' }} onClick={() => loadSong(s)}
+                  title={`${s.bpm} BPM · ${s.notes.length} 音符 · ${new Date(s.updatedAt).toLocaleString('zh-CN')} · 点击加载`}>
+                  {s.name} · {s.bpm}bpm · {new Date(s.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
                 </span>
                 <span style={{ cursor: 'pointer', color: 'var(--err)' }} onClick={() => removeSong(s.id)} title="删除">×</span>
               </span>
@@ -793,7 +805,7 @@ export default function TranscribePage() {
                 </label>
               </div>
               <div className="muted small mt">
-                识别到 {rawNotes.length} 个音符{engine === 'bp' ? '(复音,含同时发声;响度过滤会删掉弱奏音,慎用)' : ''} · 平均置信度 {(avgConf * 100).toFixed(0)}% · 建议先核对节奏(用◀▶对齐第一拍)。调整参数会重建谱面。
+                识别到 {rawNotes.length} 个音符{engine === 'bp' ? '(复音,含同时发声;响度过滤会删掉弱奏音,慎用)' : ''} · 平均置信度 {(avgConf * 100).toFixed(0)}% · 建议先核对节奏(用◀▶对齐第一拍)。结果<b>已自动保存到下方曲库</b>(同名覆盖),刷新不丢;调整参数会重建谱面并更新曲库。
               </div>
               {swingInfo && (
                 <div className="mt" style={{ background: 'rgba(124,108,240,0.1)', border: '1px solid rgba(124,108,240,0.35)', borderRadius: 10, padding: '8px 12px', color: 'var(--accent2)', fontSize: 13 }}>
