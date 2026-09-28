@@ -671,11 +671,11 @@ export default function TranscribePage() {
           <button className="btn primary" disabled={!audio || status === 'working'} onClick={runTranscribe}>
             {status === 'working'
               ? bpStage === 'model'
-                ? `⏳ 初始化 AI 引擎${bpBackend ? `(${bpBackend === 'cpu' ? 'CPU·较慢' : bpBackend === 'wasm' ? 'WASM' : bpBackend})` : '…'}`
+                ? `⏳ 初始化 AI 引擎${bpBackend ? `(${bpBackend.startsWith('cpu') ? 'CPU' : bpBackend})` : '…'}`
                 : bpStage === 'notes'
                   ? '⏳ 提取音符中…'
                   : bpProgress !== null
-                    ? `⏳ AI 推理 ${(bpProgress * 100).toFixed(0)}%${bpBackend === 'cpu' ? '(CPU)' : bpBackend === 'wasm' ? '(WASM)' : ''}`
+                    ? `⏳ AI 推理 ${(bpProgress * 100).toFixed(0)}%${bpBackend.startsWith('cpu') ? '(CPU)' : ''}`
                     : '⏳ 分析中…'
               : '✨ 开始扒谱'}
           </button>

@@ -25,9 +25,25 @@ export interface BpOptions {
   frameThresh?: number // 延音阈值(默认 0.2)
   minNoteLenFrames?: number // 最短音符(帧,86fps;默认 35 ≈ 0.4s,快句友好)
   removeOctaveGhosts?: boolean // 去除同时段的八度重影(默认开;和弦含真八度时应关闭)
-  forceBackend?: 'wasm' | 'cpu' // 看门狗重试时指定的回退后端
+  forceCpu?: boolean // 跳过 WebGL 直接用 CPU(看门狗回退 / 并行模式)
   modelUrl?: string // 模型地址:由主线程按页面地址解析后传给 worker(dev 与构建环境统一)
-  wasmBase?: string // WASM 文件目录地址(同上)
+}
+
+/** 初始化 TF.js 后端:优先 WebGL;虚拟显示驱动下 GL 推理会挂死,由看门狗回退并行 CPU */
+export async function ensureBackend(forceCpu = false): Promise<string> {
+  const tf = await import('@tensorflow/tfjs')
+  if (!forceCpu) {
+    try {
+      await tf.setBackend('webgl')
+      await tf.ready()
+      if (tf.getBackend() === 'webgl') return 'webgl'
+    } catch {
+      /* 回退 CPU */
+    }
+  }
+  await tf.setBackend('cpu')
+  await tf.ready()
+  return tf.getBackend()
 }
 
 export type BpStage = 'model' | 'infer' | 'notes'
@@ -47,54 +63,14 @@ const CHUNK_SAMPLES = 60 * 22050 // 每块 60s
 let modulePromise: Promise<BpModule> | null = null
 let modelPromise: Promise<InstanceType<BpModule['BasicPitch']>> | null = null
 
-async function getModule(): Promise<BpModule> {
+export async function getModule(): Promise<BpModule> {
   if (!modulePromise) {
     modulePromise = import('@spotify/basic-pitch')
   }
   return modulePromise
 }
 
-/** 初始化 TF.js 后端。优先级:
- *  auto: webgl → wasm(SIMD 纯 CPU,虚拟显示驱动下 GL 推理挂死时的最优解)→ cpu;
- *  force 指定时直接用对应后端。返回实际后端名 */
-async function ensureBackend(force?: 'wasm' | 'cpu', wasmBase?: string): Promise<string> {
-  const tf = await import('@tensorflow/tfjs')
-  if (force !== 'cpu') {
-    if (force === 'wasm') {
-      return await initWasm(wasmBase)
-    }
-    try {
-      await tf.setBackend('webgl')
-      await tf.ready()
-      if (tf.getBackend() === 'webgl') return 'webgl'
-    } catch {
-      /* 落到 wasm */
-    }
-    try {
-      return await initWasm(wasmBase)
-    } catch {
-      /* 落到 cpu */
-    }
-  }
-  await tf.setBackend('cpu')
-  await tf.ready()
-  return tf.getBackend()
-}
-
-/** WASM 后端:纯 SIMD CPU 计算,不碰 GL——向日葵/ToDesk 虚拟显示驱动下
- *  Worker-GL 初始化能过但真实推理提交会挂死,WASM 是这类环境的可靠提速方案 */
-async function initWasm(wasmBase?: string): Promise<string> {
-  const tf = await import('@tensorflow/tfjs')
-  const wasm = await import('@tensorflow/tfjs-backend-wasm')
-  if (wasmBase) wasm.setWasmPaths(wasmBase)
-  await tf.setBackend('wasm')
-  await tf.ready()
-  const be = tf.getBackend()
-  if (be !== 'wasm') throw new Error('wasm backend unavailable')
-  return be
-}
-
-async function getModel(modelUrl?: string) {
+export async function getModel(modelUrl?: string) {
   if (!modelPromise) {
     const url = modelUrl ?? MODEL_URL
     modelPromise = (async () => {
@@ -208,7 +184,7 @@ export async function transcribeWithBasicPitchChannels(
   onStage: BpStageFn,
 ): Promise<TranscribeResult> {
   onStage('model')
-  const backend = await ensureBackend(req.forceBackend, req.wasmBase)
+  const backend = await ensureBackend(req.forceCpu)
   const m = await getModule()
   loadedModule = m
   const bp = await getModel(req.modelUrl)
@@ -353,9 +329,103 @@ function runWorkerJob(
   })
 }
 
+/** 单 Worker CPU 推理(短音频,或并行不可用时的回退) */
+async function runSingleCpu(
+  buffer: AudioBuffer,
+  opts: BpOptions,
+  modelUrl: string,
+  onProgress: BpProgress,
+  onStage: BpStageFn,
+): Promise<TranscribeResult> {
+  const channels: Float32Array[] = []
+  for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice())
+  return runWorkerJob(
+    { type: 'run', opts: { ...opts, forceCpu: true, modelUrl }, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
+    onProgress,
+    onStage,
+  )
+}
+
+/** 并行 CPU 推理:音频切成 N 块,分给 N 个临时 Worker 同时跑(各自加载模型,CPU 后端),
+ *  顺序汇总帧矩阵后交给常驻 Worker 做音符提取。GL 挂死环境(向日葵/ToDesk 虚拟显示驱动)的多核提速。 */
+async function runParallelCpu(
+  buffer: AudioBuffer,
+  opts: BpOptions,
+  modelUrl: string,
+  onProgress: BpProgress,
+  onStage: BpStageFn,
+): Promise<TranscribeResult> {
+  const cores = navigator.hardwareConcurrency || 4
+  const N = Math.max(1, Math.min(4, Math.floor(cores / 3)))
+  if (N < 2 || buffer.duration < 24) return runSingleCpu(buffer, opts, modelUrl, onProgress, onStage)
+  onStage('model')
+  const channels: Float32Array[] = []
+  for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice())
+  const mono = toMono(channels, buffer.length)
+  const resampled = resampleLinear(mono, buffer.sampleRate, SR)
+  // 切块(与 evaluateChunked 同规则:块尾多带一个 2s 窗口上下文,汇总时裁掉越界帧)
+  const chunkTarget = Math.ceil(resampled.length / N)
+  const chunks: { start: number; span: number }[] = []
+  for (let start = 0; start < resampled.length; start += chunkTarget) {
+    chunks.push({ start, span: Math.min(chunkTarget, resampled.length - start) })
+  }
+  const total = chunks.length
+  const results: { frames: number[][]; onsets: number[][] }[] = []
+  let done = 0
+  const spawned: Worker[] = []
+  const jobs = chunks.map(
+    (c, idx) =>
+      new Promise<void>((resolve, reject) => {
+        const w = new Worker(new URL('./bpWorker.ts', import.meta.url), { type: 'module' })
+        spawned.push(w)
+        const input = resampled.subarray(c.start, Math.min(resampled.length, c.start + c.span + WINDOW_SAMPLES))
+        const pcm = new Float32Array(input)
+        const nominal = Math.floor((c.span * FPS) / SR)
+        w.onmessage = (e: MessageEvent) => {
+          const { type, p, stage, info, frames, onsets, message } = e.data ?? {}
+          if (type === 'progress') {
+            onStage('infer')
+            onProgress(Math.min(0.99, (done + (p ?? 0)) / total))
+          } else if (type === 'stage' && stage === 'model') {
+            onStage('model', (info ?? 'cpu') + '·并行×' + total)
+          } else if (type === 'done') {
+            results[idx] = { frames: frames.slice(0, nominal), onsets: onsets.slice(0, nominal) }
+            done++
+            onProgress(done / total)
+            w.terminate()
+            resolve()
+          } else if (type === 'error') {
+            w.terminate()
+            reject(new Error(message))
+          }
+        }
+        w.onerror = () => {
+          w.terminate()
+          reject(new Error('并行 Worker 崩溃'))
+        }
+        w.postMessage({ type: 'runChunk', opts: { ...opts, forceCpu: true, modelUrl }, pcm }, [pcm.buffer])
+      }),
+  )
+  try {
+    await Promise.all(jobs)
+  } finally {
+    spawned.forEach((w) => w.terminate())
+  }
+  // 按顺序拼接帧矩阵
+  const frames: number[][] = []
+  const onsets: number[][] = []
+  for (const r of results) {
+    for (const f of r.frames) frames.push(f)
+    for (const o of r.onsets) onsets.push(o)
+  }
+  onProgress(1)
+  onStage('notes')
+  // 重后处理(纯 JS)交回常驻 Worker
+  return runWorkerJob({ type: 'postFrames', opts, frames, onsets, duration: buffer.duration }, onProgress, onStage, 30 * 60000)
+}
+
 /** 对 AudioBuffer 跑 Basic Pitch。
- *  顺序:Worker 全管线(WebGL)→ (GL 挂起,虚拟显示器/远程控制环境)Worker-CPU 兜底 → 报错。
- *  实测这类环境下页面内 GL 也是软件渲染,速度与 CPU 相当还会占用主线程,故不做页面内推理。 */
+ *  顺序:Worker 全管线(WebGL)→ (GL 挂起,虚拟显示驱动)并行 CPU(多 Worker 分块)→ 单 Worker CPU → 报错。 */
 export async function transcribeWithBasicPitch(
   buffer: AudioBuffer,
   opts: BpOptions,
@@ -363,16 +433,15 @@ export async function transcribeWithBasicPitch(
   onStage: BpStageFn,
 ): Promise<TranscribeResult> {
   const dbg = (globalThis as unknown as Record<string, unknown>)
-  // 模型/WASM 地址在主线程按页面地址解析(可靠),随任务传给 worker
+  // 模型地址在主线程按页面地址解析(可靠),随任务传给 worker
   // ——dev 里 worker 脚本位于 /src/transcription/,自行相对解析会指错位置
   const modelUrl = new URL('vendor/basic-pitch/model.json', document.baseURI).href
-  const wasmBase = new URL('vendor/tfjs-wasm/', document.baseURI).href
   const runMainFallback = async () => {
     dbg.__bpMode = 'main-fallback'
     const channels: Float32Array[] = []
     for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice())
     return transcribeWithBasicPitchChannels(
-      { ...opts, modelUrl, wasmBase, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
+      { ...opts, modelUrl, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
       onProgress,
       onStage,
     )
@@ -385,7 +454,7 @@ export async function transcribeWithBasicPitch(
     return await runWorkerJob(
       {
         type: 'run',
-        opts: { ...opts, modelUrl, wasmBase },
+        opts: { ...opts, modelUrl },
         channels,
         sampleRate: buffer.sampleRate,
         duration: buffer.duration,
@@ -395,32 +464,18 @@ export async function transcribeWithBasicPitch(
     )
   } catch (e) {
     if (String((e as Error)?.message).includes('WEBGL_HANG')) {
-      // Worker 的 WebGL 挂死(远程桌面/虚拟显示驱动):整杀重建,先试 WASM(SIMD,不碰 GL),
-      // WASM 也不可用再退纯 JS CPU
+      // Worker 的 WebGL 挂死(远程桌面/虚拟显示驱动):换多 Worker 并行 CPU
       if (!getBpWorker()) return runMainFallback()
-      dbg.__bpMode = 'worker-wasm'
+      dbg.__bpMode = 'parallel-cpu'
       onStage('model')
       onProgress(0)
-      const channels: Float32Array[] = []
-      for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice())
       try {
-        return await runWorkerJob(
-          { type: 'run', opts: { ...opts, modelUrl, wasmBase, forceBackend: 'wasm' }, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
-          onProgress,
-          onStage,
-        )
+        return await runParallelCpu(buffer, opts, modelUrl, onProgress, onStage)
       } catch (e2) {
-        ;(globalThis as unknown as Record<string, unknown>).__wasmErr = String(e2) + ' | ' + String((e2 as Error)?.stack ?? '').slice(0, 300)
         dbg.__bpMode = 'worker-cpu'
         onStage('model')
         onProgress(0)
-        const channels2: Float32Array[] = []
-        for (let c = 0; c < buffer.numberOfChannels; c++) channels2.push(buffer.getChannelData(c).slice())
-        return runWorkerJob(
-          { type: 'run', opts: { ...opts, modelUrl, wasmBase, forceBackend: 'cpu' }, channels: channels2, sampleRate: buffer.sampleRate, duration: buffer.duration },
-          onProgress,
-          onStage,
-        )
+        return runSingleCpu(buffer, opts, modelUrl, onProgress, onStage)
       }
     }
     throw e
