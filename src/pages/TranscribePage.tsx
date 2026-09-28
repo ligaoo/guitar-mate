@@ -38,6 +38,13 @@ export default function TranscribePage() {
   const [ghostFilter, setGhostFilter] = useState(true)
   const [visibleBars, setVisibleBars] = useState(8)
 
+  // 响度过滤默认值随引擎切换:BP 的 amplitude≈响度,真实歌曲大量音符低于 0.55,
+  // 会被整段删掉(实测 1151 音符只剩 80);DSP 的置信度保持 0.55
+  const switchEngine = (e: Engine) => {
+    setEngine(e)
+    setMinConf(e === 'bp' ? 0.25 : 0.55)
+  }
+
   const [bpm, setBpm] = useState(90)
   const [offsetSteps, setOffsetSteps] = useState(0)
   const [minConf, setMinConf] = useState(0.55)
@@ -694,9 +701,9 @@ export default function TranscribePage() {
         </div>
         <div className="row mt">
           <div className="chip-row">
-            <button className={`chip${engine === 'dsp' ? ' active' : ''}`} onClick={() => setEngine('dsp')}
+            <button className={`chip${engine === 'dsp' ? ' active' : ''}`} onClick={() => switchEngine('dsp')}
               title="纯信号处理,零模型加载,适合单音旋律">⚡ 内置 DSP(离线 · 单音)</button>
-            <button className={`chip${engine === 'bp' ? ' active' : ''}`} onClick={() => setEngine('bp')}
+            <button className={`chip${engine === 'bp' ? ' active' : ''}`} onClick={() => switchEngine('bp')}
               title="Spotify Basic Pitch 神经网络,支持和弦等复音;首次使用需加载 AI 引擎(约 2MB,之后有缓存)">🧠 Basic Pitch(复音 · AI)</button>
           </div>
           {engine === 'bp' && (
