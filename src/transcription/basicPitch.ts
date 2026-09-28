@@ -25,7 +25,8 @@ export interface BpOptions {
   frameThresh?: number // 延音阈值(默认 0.2)
   minNoteLenFrames?: number // 最短音符(帧,86fps;默认 35 ≈ 0.4s,快句友好)
   removeOctaveGhosts?: boolean // 去除同时段的八度重影(默认开;和弦含真八度时应关闭)
-  forceCpu?: boolean // 跳过 WebGL 直接用 CPU
+  forceCpu?: boolean // 跳过 WebGL 直接用 CPU(远程桌面/虚拟 GPU 环境的自动回退)
+  modelUrl?: string // 模型地址:由主线程按页面地址解析后传给 worker(dev 与构建环境统一)
 }
 
 export type BpStage = 'model' | 'infer' | 'notes'
@@ -69,11 +70,12 @@ async function ensureBackend(forceCpu = false): Promise<string> {
   return tf.getBackend()
 }
 
-async function getModel() {
+async function getModel(modelUrl?: string) {
   if (!modelPromise) {
+    const url = modelUrl ?? MODEL_URL
     modelPromise = (async () => {
       const m = await getModule()
-      return new m.BasicPitch(MODEL_URL)
+      return new m.BasicPitch(url)
     })()
     modelPromise.catch(() => {
       modelPromise = null
@@ -185,7 +187,7 @@ export async function transcribeWithBasicPitchChannels(
   const backend = await ensureBackend(req.forceCpu)
   const m = await getModule()
   loadedModule = m
-  const bp = await getModel()
+  const bp = await getModel(req.modelUrl)
   onStage('model', backend)
   const mono = toMono(req.channels, req.channels[0].length)
   const resampled = resampleLinear(mono, req.sampleRate, SR)
@@ -337,12 +339,15 @@ export async function transcribeWithBasicPitch(
   onStage: BpStageFn,
 ): Promise<TranscribeResult> {
   const dbg = (globalThis as unknown as Record<string, unknown>)
+  // 模型地址在主线程按页面地址解析(可靠),随任务传给 worker
+  // ——dev 里 worker 脚本位于 /src/transcription/,自行相对解析会指错位置
+  const modelUrl = new URL('vendor/basic-pitch/model.json', document.baseURI).href
   const runMainFallback = async () => {
     dbg.__bpMode = 'main-fallback'
     const channels: Float32Array[] = []
     for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice())
     return transcribeWithBasicPitchChannels(
-      { ...opts, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
+      { ...opts, modelUrl, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
       onProgress,
       onStage,
     )
@@ -355,7 +360,7 @@ export async function transcribeWithBasicPitch(
     return await runWorkerJob(
       {
         type: 'run',
-        opts,
+        opts: { ...opts, modelUrl },
         channels,
         sampleRate: buffer.sampleRate,
         duration: buffer.duration,
@@ -373,7 +378,7 @@ export async function transcribeWithBasicPitch(
       const channels: Float32Array[] = []
       for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice())
       return runWorkerJob(
-        { type: 'run', opts: { ...opts, forceCpu: true }, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
+        { type: 'run', opts: { ...opts, modelUrl, forceCpu: true }, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
         onProgress,
         onStage,
       )
