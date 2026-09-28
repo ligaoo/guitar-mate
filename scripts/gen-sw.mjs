@@ -17,6 +17,9 @@ const CORE = [
   'icons/icon-512.png',
   'vendor/basic-pitch/model.json',
   'vendor/basic-pitch/group1-shard1of1.bin',
+  'vendor/tfjs-wasm/tfjs-backend-wasm.wasm',
+  'vendor/tfjs-wasm/tfjs-backend-wasm-simd.wasm',
+  'vendor/tfjs-wasm/tfjs-backend-wasm-threaded-simd.wasm',
 ].map((u) => new URL(u, self.registration.scope).href)
 
 self.addEventListener('install', (e) => {

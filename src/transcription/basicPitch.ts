@@ -25,8 +25,9 @@ export interface BpOptions {
   frameThresh?: number // 延音阈值(默认 0.2)
   minNoteLenFrames?: number // 最短音符(帧,86fps;默认 35 ≈ 0.4s,快句友好)
   removeOctaveGhosts?: boolean // 去除同时段的八度重影(默认开;和弦含真八度时应关闭)
-  forceCpu?: boolean // 跳过 WebGL 直接用 CPU(远程桌面/虚拟 GPU 环境的自动回退)
+  forceBackend?: 'wasm' | 'cpu' // 看门狗重试时指定的回退后端
   modelUrl?: string // 模型地址:由主线程按页面地址解析后传给 worker(dev 与构建环境统一)
+  wasmBase?: string // WASM 文件目录地址(同上)
 }
 
 export type BpStage = 'model' | 'infer' | 'notes'
@@ -53,21 +54,44 @@ async function getModule(): Promise<BpModule> {
   return modulePromise
 }
 
-/** 初始化 TF.js 后端:优先 WebGL(worker/虚拟显示器下可能无声挂起,由看门狗兜底) */
-async function ensureBackend(forceCpu = false): Promise<string> {
+/** 初始化 TF.js 后端。优先级:
+ *  auto: webgl → wasm(SIMD 纯 CPU,虚拟显示驱动下 GL 推理挂死时的最优解)→ cpu;
+ *  force 指定时直接用对应后端。返回实际后端名 */
+async function ensureBackend(force?: 'wasm' | 'cpu', wasmBase?: string): Promise<string> {
   const tf = await import('@tensorflow/tfjs')
-  if (!forceCpu) {
+  if (force !== 'cpu') {
+    if (force === 'wasm') {
+      return await initWasm(wasmBase)
+    }
     try {
       await tf.setBackend('webgl')
       await tf.ready()
-      return tf.getBackend()
+      if (tf.getBackend() === 'webgl') return 'webgl'
     } catch {
-      /* 回退 CPU */
+      /* 落到 wasm */
+    }
+    try {
+      return await initWasm(wasmBase)
+    } catch {
+      /* 落到 cpu */
     }
   }
   await tf.setBackend('cpu')
   await tf.ready()
   return tf.getBackend()
+}
+
+/** WASM 后端:纯 SIMD CPU 计算,不碰 GL——向日葵/ToDesk 虚拟显示驱动下
+ *  Worker-GL 初始化能过但真实推理提交会挂死,WASM 是这类环境的可靠提速方案 */
+async function initWasm(wasmBase?: string): Promise<string> {
+  const tf = await import('@tensorflow/tfjs')
+  const wasm = await import('@tensorflow/tfjs-backend-wasm')
+  if (wasmBase) wasm.setWasmPaths(wasmBase)
+  await tf.setBackend('wasm')
+  await tf.ready()
+  const be = tf.getBackend()
+  if (be !== 'wasm') throw new Error('wasm backend unavailable')
+  return be
 }
 
 async function getModel(modelUrl?: string) {
@@ -184,7 +208,7 @@ export async function transcribeWithBasicPitchChannels(
   onStage: BpStageFn,
 ): Promise<TranscribeResult> {
   onStage('model')
-  const backend = await ensureBackend(req.forceCpu)
+  const backend = await ensureBackend(req.forceBackend, req.wasmBase)
   const m = await getModule()
   loadedModule = m
   const bp = await getModel(req.modelUrl)
@@ -339,15 +363,16 @@ export async function transcribeWithBasicPitch(
   onStage: BpStageFn,
 ): Promise<TranscribeResult> {
   const dbg = (globalThis as unknown as Record<string, unknown>)
-  // 模型地址在主线程按页面地址解析(可靠),随任务传给 worker
+  // 模型/WASM 地址在主线程按页面地址解析(可靠),随任务传给 worker
   // ——dev 里 worker 脚本位于 /src/transcription/,自行相对解析会指错位置
   const modelUrl = new URL('vendor/basic-pitch/model.json', document.baseURI).href
+  const wasmBase = new URL('vendor/tfjs-wasm/', document.baseURI).href
   const runMainFallback = async () => {
     dbg.__bpMode = 'main-fallback'
     const channels: Float32Array[] = []
     for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice())
     return transcribeWithBasicPitchChannels(
-      { ...opts, modelUrl, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
+      { ...opts, modelUrl, wasmBase, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
       onProgress,
       onStage,
     )
@@ -360,7 +385,7 @@ export async function transcribeWithBasicPitch(
     return await runWorkerJob(
       {
         type: 'run',
-        opts: { ...opts, modelUrl },
+        opts: { ...opts, modelUrl, wasmBase },
         channels,
         sampleRate: buffer.sampleRate,
         duration: buffer.duration,
@@ -370,18 +395,32 @@ export async function transcribeWithBasicPitch(
     )
   } catch (e) {
     if (String((e as Error)?.message).includes('WEBGL_HANG')) {
-      // Worker 的 WebGL 挂死(远程桌面/虚拟显示驱动):同一 worker 整杀重建,强制 CPU 重试
+      // Worker 的 WebGL 挂死(远程桌面/虚拟显示驱动):整杀重建,先试 WASM(SIMD,不碰 GL),
+      // WASM 也不可用再退纯 JS CPU
       if (!getBpWorker()) return runMainFallback()
-      dbg.__bpMode = 'worker-cpu'
+      dbg.__bpMode = 'worker-wasm'
       onStage('model')
       onProgress(0)
       const channels: Float32Array[] = []
       for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice())
-      return runWorkerJob(
-        { type: 'run', opts: { ...opts, modelUrl, forceCpu: true }, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
-        onProgress,
-        onStage,
-      )
+      try {
+        return await runWorkerJob(
+          { type: 'run', opts: { ...opts, modelUrl, wasmBase, forceBackend: 'wasm' }, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
+          onProgress,
+          onStage,
+        )
+      } catch (e2) {
+        dbg.__bpMode = 'worker-cpu'
+        onStage('model')
+        onProgress(0)
+        const channels2: Float32Array[] = []
+        for (let c = 0; c < buffer.numberOfChannels; c++) channels2.push(buffer.getChannelData(c).slice())
+        return runWorkerJob(
+          { type: 'run', opts: { ...opts, modelUrl, wasmBase, forceBackend: 'cpu' }, channels: channels2, sampleRate: buffer.sampleRate, duration: buffer.duration },
+          onProgress,
+          onStage,
+        )
+      }
     }
     throw e
   }
