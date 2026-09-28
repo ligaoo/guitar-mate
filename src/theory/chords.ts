@@ -236,16 +236,27 @@ function computeVoicings(rootPc: number, intervals: number[], tuning: number[], 
 
   dfs(0)
   results.sort((a, b) => b.score - a.score)
-  // 去掉指法完全相同的重复项
+  // 按显示形状去重:仅边缘闷音/空弦不同、或同形状换弦组的指法画出来几乎一样,只留评分最高的
   const seen = new Set<string>()
   const uniq: Voicing[] = []
   for (const v of results) {
-    const sig = v.frets.join(',')
+    const sig = shapeSignature(v.frets)
     if (seen.has(sig)) continue
     seen.add(sig)
     uniq.push(v)
   }
   return uniq
+}
+
+/** 显示形状签名:发声弦的品位居点(相对最低发声品),去掉首尾空弦(边缘空弦在图上与闷音几乎无差) */
+function shapeSignature(frets: number[]): string {
+  const rel = frets.filter((f) => f >= 0)
+  if (rel.length === 0) return ''
+  const min = Math.min(...rel)
+  const arr = rel.map((f) => f - min)
+  while (arr.length && arr[0] === 0) arr.shift()
+  while (arr.length && arr[arr.length - 1] === 0) arr.pop()
+  return arr.join(',')
 }
 
 /** 由音程组反查类型 id(用于教科书指法表匹配) */

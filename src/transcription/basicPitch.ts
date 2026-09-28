@@ -1,12 +1,12 @@
 // Basic Pitch(Spotify 开源)复音识别引擎封装
-// 三级执行策略,保证任何环境都能出结果且不冻结页面:
+// 四级执行策略,保证任何环境都能出结果且尽量不冻结页面:
 //   ① 常驻 Worker 全管线(正常桌面:Worker-WebGL,最佳)
-//   ② 混合模式(虚拟显示器/远程控制环境 Worker-WebGL 挂起时):
-//      主线程用真实 canvas 的 WebGL 分块推理(批间让出事件循环,进度可刷新),
-//      重后处理(melodia O(音符×帧) )仍发回 Worker 执行
-//   ③ Worker-CPU 兜底(慢,但一定有结果)
+//   ② Worker-GL 挂死时:主线程 WebGL 分块推理(预检 + latch + 活动看门狗;
+//      嵌入式浏览器如 ZCode 内嵌 WebView 的 Worker GL 回读挂死,但主线程 GL 正常)
+//   ③ 多 Worker 并行 CPU(主线程 GL 也不可用时)
+//   ④ 单 Worker CPU 兜底(慢,但一定有结果)
 // 长音频按 60s 分块推理,避免一次性构建数百 MB 的帧张量
-import { toMono, resampleLinear, estimateBpm, SR, type TranscribeResult, type RawNote } from './pipeline'
+import { toMono, resampleLinear, estimateBpm, estimateBpmFromEnvelope, SR, type TranscribeResult, type RawNote } from './pipeline'
 
 // 模型路径按运行上下文解析:页面里相对页面(支持子路径部署);
 // Worker 里相对 worker 脚本(位于 assets/ 下,回退一级)
@@ -23,10 +23,12 @@ type BpModule = typeof import('@spotify/basic-pitch')
 export interface BpOptions {
   onsetThresh?: number // 起音阈值,越低越灵敏(默认 0.35)
   frameThresh?: number // 延音阈值(默认 0.2)
-  minNoteLenFrames?: number // 最短音符(帧,86fps;默认 35 ≈ 0.4s,快句友好)
+  minNoteLenFrames?: number // 最短音符(帧,86fps;默认 12 ≈ 140ms,16 分音符可检出)
   removeOctaveGhosts?: boolean // 去除同时段的八度重影(默认开;和弦含真八度时应关闭)
   forceCpu?: boolean // 跳过 WebGL 直接用 CPU(看门狗回退 / 并行模式)
   modelUrl?: string // 模型地址:由主线程按页面地址解析后传给 worker(dev 与构建环境统一)
+  minHz?: number // 音域下限(默认 70Hz ≈ Drop D 的 D2):整曲混识别时切掉贝斯/底鼓
+  maxHz?: number // 音域上限(默认 1350Hz ≈ 22 品高音弦):切掉镲片泛音等超声垃圾
 }
 
 /** 初始化 TF.js 后端:优先 WebGL;虚拟显示驱动下 GL 推理会挂死,由看门狗回退并行 CPU */
@@ -54,6 +56,7 @@ interface BpChannelsRequest extends BpOptions {
   channels: Float32Array[]
   sampleRate: number
   duration: number
+  postOnWorker?: boolean // 重后处理(melodia)发回常驻 Worker:主线程 GL 路径下避免长音频提取阶段冻结页面
 }
 
 const FPS = Math.floor(22050 / 256) // 86 帧/秒
@@ -90,6 +93,31 @@ function resetEngine() {
 }
 
 const yieldToEventLoop = () => new Promise<void>((r) => setTimeout(r, 0))
+
+/** 主线程 GL 健康预检:微型矩阵乘 + 回读,3 秒竞速。
+ *  部分嵌入浏览器(如 ZCode 内嵌 WebView)Worker 内的 GL 回读会永久挂死,
+ *  但主线程 GL 正常——本预检通过才走主线程 GPU 救援路径。 */
+async function mainGlHealthCheck(): Promise<boolean> {
+  try {
+    const backend = await ensureBackend(false)
+    if (backend !== 'webgl') return false
+    const tf = await import('@tensorflow/tfjs')
+    const a = tf.randomNormal([128, 128])
+    const b = tf.matMul(a, a)
+    const ok = await Promise.race([
+      b.data().then(
+        () => true,
+        () => false,
+      ),
+      new Promise<boolean>((r) => setTimeout(() => r(false), 3000)),
+    ])
+    a.dispose()
+    b.dispose()
+    return ok
+  } catch {
+    return false
+  }
+}
 
 /** 分块推理:60s 一块,块间带一个窗口的重叠上下文并裁掉越界帧。
  *  避免长音频一次性构建 (总时长×86 帧) 的巨型张量;每块结束让出事件循环,
@@ -141,15 +169,17 @@ export async function postProcessFrames(
 ): Promise<TranscribeResult> {
   const m = loadedModule ?? (await getModule())
   loadedModule = m
+  // 音域限频在音符生成之前生效(constrainFrequency 直接抹掉帧矩阵):整曲混识别时
+  // 贝斯/底鼓(<70Hz)与镲片泛音(>1350Hz)不会变成音符
   const events = m.outputToNotesPoly(
     frames,
     onsets,
     opts.onsetThresh ?? 0.35,
     opts.frameThresh ?? 0.2,
-    opts.minNoteLenFrames ?? 35,
+    opts.minNoteLenFrames ?? 12,
     true,
-    null,
-    null,
+    opts.maxHz ?? 1350,
+    opts.minHz ?? 70,
     true,
   )
   const timed = m.noteFramesToTime(events)
@@ -165,10 +195,21 @@ export async function postProcessFrames(
   notes.sort((a, b) => a.start - b.start || a.midi - b.midi)
   if (opts.removeOctaveGhosts !== false) notes = removeOctaveGhosts(notes)
   const onsetsT = [...new Set(notes.map((n) => +n.start.toFixed(3)))].sort((a, b) => a - b)
+  // 整曲节拍:起音包络自相关(跟全曲律动,含鼓点驱动的起音),锁定不住再退回音符间隔直方图
+  const env = new Float32Array(onsets.length)
+  for (let f = 0; f < onsets.length; f++) {
+    let s = 0
+    const of = onsets[f]
+    for (let i = 0; i < of.length; i++) s += of[i]
+    env[f] = s
+  }
+  const envBpm = estimateBpmFromEnvelope(env, FPS)
+  const bpm = envBpm.strength > 0.1 ? envBpm.bpm : estimateBpm(onsetsT).bpm
   return {
     notes,
     onsets: onsetsT,
-    bpm: estimateBpm(onsetsT).bpm,
+    bpm,
+    bpmStrength: envBpm.strength,
     offset: onsetsT.length ? onsetsT[0] : 0,
     duration,
     f0Track: new Float32Array(0),
@@ -207,6 +248,15 @@ export async function transcribeWithBasicPitchChannels(
   onProgress(1)
   onStage('notes')
   await yieldToEventLoop()
+  // 重后处理是 O(音符×帧) 的纯 JS:长音频在主线程要跑数分钟会冻结页面,发回常驻 Worker
+  if (req.postOnWorker && getBpWorker()) {
+    return runWorkerJob(
+      { type: 'postFrames', opts: req, frames, onsets, duration: req.duration },
+      onProgress,
+      onStage,
+      30 * 60000,
+    )
+  }
   const result = await postProcessFrames(frames, onsets, req, req.duration)
   frames = []
   onsets = []
@@ -242,6 +292,8 @@ function removeOctaveGhosts(notes: RawNote[]): RawNote[] {
 
 let bpWorker: Worker | null = null
 let jobSeq = 0
+// 本页面会话内 Worker-GL 已确认挂死:后续任务跳过 45s 看门狗等待,直接走回退链
+let workerGlDead = false
 
 interface PendingJob {
   resolve: (r: TranscribeResult) => void
@@ -436,17 +488,122 @@ export async function transcribeWithBasicPitch(
   // 模型地址在主线程按页面地址解析(可靠),随任务传给 worker
   // ——dev 里 worker 脚本位于 /src/transcription/,自行相对解析会指错位置
   const modelUrl = new URL('vendor/basic-pitch/model.json', document.baseURI).href
-  const runMainFallback = async () => {
-    dbg.__bpMode = 'main-fallback'
+  const runMainFallback = async (
+    onP: BpProgress = onProgress,
+    onS: BpStageFn = onStage,
+  ) => {
     const channels: Float32Array[] = []
     for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice())
     return transcribeWithBasicPitchChannels(
-      { ...opts, modelUrl, channels, sampleRate: buffer.sampleRate, duration: buffer.duration },
-      onProgress,
-      onStage,
+      { ...opts, modelUrl, channels, sampleRate: buffer.sampleRate, duration: buffer.duration, postOnWorker: true },
+      onP,
+      onS,
     )
   }
-  if (!getBpWorker()) return runMainFallback()
+  if (!getBpWorker()) {
+    dbg.__bpMode = 'main-fallback'
+    return runMainFallback()
+  }
+  // Worker-GL 的回退链:① 主线程 GL(预检+latch+看门狗)→ ② 并行 CPU → ③ 单 Worker CPU
+  const runFallbackChain = async (): Promise<TranscribeResult> => {
+    // 主线程 GPU 救援:Worker-GL 挂死的环境里主线程 GL 往往仍可用(ZCode 内嵌 WebView 实测如此),
+    // 预检通过才走;先落 latch 再尝试,若主线程 GL 也把页面冻死,重载后凭 latch 永久跳过
+    const GL_LATCH = 'gm-bp-main-gl-dead'
+    let mainGlDead = false
+    try {
+      mainGlDead = localStorage.getItem(GL_LATCH) === '1'
+    } catch {
+      /* ignore */
+    }
+    if (!mainGlDead && (await mainGlHealthCheck())) {
+      dbg.__bpMode = 'main-webgl'
+      onStage('model', 'webgl·主线程')
+      onProgress(0)
+      try {
+        localStorage.setItem(GL_LATCH, '1')
+      } catch {
+        /* ignore */
+      }
+      try {
+        // 活动看门狗:90s 无进度判定挂死,回退 CPU;notes 阶段在 Worker 跑且无中间消息,豁免
+        const r = await new Promise<TranscribeResult>((resolve, reject) => {
+          let last = Date.now()
+          let settled = false
+          let stage: BpStage | '' = ''
+          const wd = window.setInterval(() => {
+            if (settled || stage === 'notes') return
+            if (Date.now() - last > 90000) {
+              settled = true
+              window.clearInterval(wd)
+              reject(new Error('MAIN_GL_HANG'))
+            }
+          }, 5000)
+          const mark = () => {
+            last = Date.now()
+          }
+          runMainFallback(
+            (p) => {
+              mark()
+              onProgress(p)
+            },
+            (s, info) => {
+              mark()
+              stage = s
+              onStage(s, info)
+            },
+          ).then(
+            (v) => {
+              if (!settled) {
+                settled = true
+                window.clearInterval(wd)
+                resolve(v)
+              }
+            },
+            (err) => {
+              if (!settled) {
+                settled = true
+                window.clearInterval(wd)
+                reject(err)
+              }
+            },
+          )
+        })
+        try {
+          localStorage.removeItem(GL_LATCH)
+        } catch {
+          /* ignore */
+        }
+        return r
+      } catch (e2) {
+        // 主线程 GL 也失败(保持 latch,今后直接走 CPU)
+        ;(globalThis as unknown as Record<string, unknown>).__mainGlErr =
+          String(e2) + ' | ' + String((e2 as Error)?.stack ?? '').slice(0, 400)
+      }
+    }
+    // 并行 CPU
+    if (!getBpWorker()) {
+      dbg.__bpMode = 'main-fallback'
+      return runMainFallback()
+    }
+    dbg.__bpMode = 'parallel-cpu'
+    onStage('model')
+    onProgress(0)
+    try {
+      return await runParallelCpu(buffer, opts, modelUrl, onProgress, onStage)
+    } catch (e2) {
+      ;(globalThis as unknown as Record<string, unknown>).__parErr = String(e2) + ' | ' + String((e2 as Error)?.stack ?? '').slice(0, 400)
+      dbg.__bpMode = 'worker-cpu'
+      onStage('model')
+      onProgress(0)
+      return runSingleCpu(buffer, opts, modelUrl, onProgress, onStage)
+    }
+  }
+  // 本会话已确认 Worker-GL 挂死:不再白等 45s 看门狗,直接进回退链
+  if (workerGlDead) {
+    onStage('model')
+    onProgress(0)
+    return runFallbackChain()
+  }
   dbg.__bpMode = 'worker'
   try {
     const channels: Float32Array[] = []
@@ -464,20 +621,8 @@ export async function transcribeWithBasicPitch(
     )
   } catch (e) {
     if (String((e as Error)?.message).includes('WEBGL_HANG')) {
-      // Worker 的 WebGL 挂死(远程桌面/虚拟显示驱动):换多 Worker 并行 CPU
-      if (!getBpWorker()) return runMainFallback()
-      dbg.__bpMode = 'parallel-cpu'
-      onStage('model')
-      onProgress(0)
-      try {
-        return await runParallelCpu(buffer, opts, modelUrl, onProgress, onStage)
-      } catch (e2) {
-        ;(globalThis as unknown as Record<string, unknown>).__parErr = String(e2) + ' | ' + String((e2 as Error)?.stack ?? '').slice(0, 400)
-        dbg.__bpMode = 'worker-cpu'
-        onStage('model')
-        onProgress(0)
-        return runSingleCpu(buffer, opts, modelUrl, onProgress, onStage)
-      }
+      workerGlDead = true
+      return runFallbackChain()
     }
     throw e
   }

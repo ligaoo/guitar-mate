@@ -5,6 +5,7 @@ import type { TranscribeResult } from '../transcription/pipeline'
 import { assignFingering, type TabNote, type DroppedNote } from '../transcription/fingering'
 import { tabToText, tabToMidi, downloadBlob } from '../transcription/exporters'
 import { transcribeWithBasicPitch } from '../transcription/basicPitch'
+import { detectKey, filterToKey, capPolyphony, type KeyGuess } from '../transcription/cleanup'
 import TabView from '../components/TabView'
 import { GuitarSynth } from '../audio/synth'
 import { getCtx, getMaster } from '../audio/engine'
@@ -65,6 +66,11 @@ export default function TranscribePage() {
   const [staleParams, setStaleParams] = useState(false)
   const [srcPlaying, setSrcPlaying] = useState(false)
   const [swingInfo, setSwingInfo] = useState<string | null>(null)
+  const [keyFilter, setKeyFilter] = useState(false) // 调外音过滤(整曲混识别的幻觉音大多在调外)
+  const [keyDropCount, setKeyDropCount] = useState(0)
+  const [autoDensity, setAutoDensity] = useState(true) // 自动密度:音符过多时按响度自动升阈值(整曲一次扒的关键)
+  const [autoDensityInfo, setAutoDensityInfo] = useState<string | null>(null)
+  const [vocalCut, setVocalCut] = useState(false) // 中置声道相消:消掉居中的人声/贝斯,保留左右声道的吉他
   // A/B 片段
   const [segStart, setSegStart] = useState(0)
   const [segLen, setSegLen] = useState(4)
@@ -169,6 +175,46 @@ export default function TranscribePage() {
 
   // ---------- 音源 ----------
 
+  /** 截取 AudioBuffer 片段为新 buffer(「只扒片段」用) */
+  const sliceAudio = (buf: AudioBuffer, start: number, dur: number): AudioBuffer => {
+    const ctx = getCtx()
+    const sr = buf.sampleRate
+    const s = Math.max(0, Math.floor(start * sr))
+    const e = Math.min(buf.length, Math.floor((start + dur) * sr))
+    const out = ctx.createBuffer(buf.numberOfChannels, e - s, sr)
+    for (let c = 0; c < buf.numberOfChannels; c++) {
+      out.copyToChannel(buf.getChannelData(c).subarray(s, e), c)
+    }
+    return out
+  }
+
+  /** 中置声道相消(立体声):side = (L-R)/2,居中的人声/贝斯/军鼓被消掉,
+   *  左右声道的吉他(双轨失真吉他在摇滚混音里几乎必分左右)保留。近单声道返回 null。 */
+  const centerCancelBuffer = (buf: AudioBuffer): AudioBuffer | null => {
+    if (buf.numberOfChannels < 2) return null
+    const ctx = getCtx()
+    const L = buf.getChannelData(0)
+    const R = buf.getChannelData(1)
+    const out = ctx.createBuffer(1, buf.length, buf.sampleRate)
+    const o = out.getChannelData(0)
+    let sideE = 0
+    let midE = 0
+    for (let i = 0; i < buf.length; i++) {
+      const side = (L[i] - R[i]) * 0.5
+      o[i] = side
+      sideE += side * side
+      const mid = (L[i] + R[i]) * 0.5
+      midE += mid * mid
+    }
+    // 相消后能量不足原信号的 1%:说明内容几乎全在中置,相消只会得到静音
+    if (sideE < midE * 0.01) return null
+    // 响度回补(side 通常比原 mix 轻不少)
+    const rms = Math.sqrt(sideE / buf.length)
+    const g = Math.min(8, 0.25 / Math.max(1e-6, rms))
+    for (let i = 0; i < buf.length; i++) o[i] *= g
+    return out
+  }
+
   const loadFile = async (file: File) => {
     stopPlayback()
     stopLoop()
@@ -181,6 +227,10 @@ export default function TranscribePage() {
       setFileName(`${file.name}(${buf.duration.toFixed(1)}s)`)
       setSegStart(0)
       setSegLen(Math.min(4, buf.duration))
+      // 导入的音频文件几乎都是完整混音(含人声/贝斯/鼓):默认切换到复音 AI 引擎,
+      // 单音 DSP 引擎对整首歌只会输出垃圾;录音(现场单音)则默认 DSP
+      setEngine('bp')
+      setMinConf(0.25)
     } catch {
       setErrMsg('无法解码该音频文件,请换 mp3/wav/m4a 格式。')
       setStatus('error')
@@ -205,6 +255,9 @@ export default function TranscribePage() {
       setStatus('idle')
       setResult(null)
       setLoadedSongName(null)
+      // 麦克风现场录音通常是单音演奏:默认 DSP(零模型加载,秒出)
+      setEngine('dsp')
+      setMinConf(0.55)
       stopLoop()
       setSegStart(0)
       setSegLen(Math.min(4, buf.duration))
@@ -255,18 +308,47 @@ export default function TranscribePage() {
 
   // ---------- 识别 ----------
 
-  const runTranscribe = async () => {
+  /** segment=true 只识别「片段循环」选中的区间(整首歌分段扒),时间轴换算回原音频 */
+  const runTranscribe = async (segment = false) => {
     if (!audio) return
     stopPlayback()
     setErrMsg('')
     setStatus('working')
     setLoadedSongName(null)
+    let target = audio
+    let origin = 0
+    let name = fileName.replace(/\(\d+(\.\d+)?s\)$/, '').trim() || '识别结果'
+    if (vocalCut) {
+      const cut = centerCancelBuffer(audio)
+      if (!cut) {
+        setStatus('error')
+        setErrMsg('人声消除无效:该音频左右声道几乎相同(单声道内容),相消后只剩静音。请关闭「🎤 人声消除」后重试。')
+        return
+      }
+      target = cut
+    }
+    if (segment) {
+      const len = Math.max(0.5, Math.min(segLen, audio.duration - segStart))
+      target = sliceAudio(target, segStart, len)
+      origin = segStart
+      name = `${name}·片段${segStart.toFixed(0)}s`
+    }
+    // 把片段内的时间(0 起)平移为原音频的绝对时间:A/B 对比、定位选中音直接可用
+    const shiftOrigin = (r: TranscribeResult) => {
+      if (origin <= 0) return
+      for (const n of r.notes) {
+        n.start += origin
+        n.end += origin
+      }
+      r.onsets = r.onsets.map((t) => t + origin)
+      r.offset += origin
+    }
     if (engine === 'bp') {
       setBpProgress(0)
       setBpStage('model')
       try {
         const r = await transcribeWithBasicPitch(
-          audio,
+          target,
           { onsetThresh, frameThresh, removeOctaveGhosts: ghostFilter },
           (p) => setBpProgress(p),
           (stage, info) => {
@@ -279,18 +361,20 @@ export default function TranscribePage() {
           setErrMsg('Basic Pitch 没有识别出音符。可尝试调高灵敏度(降低起音阈值)后重试。')
           return
         }
+        shiftOrigin(r)
         setResult(r)
         setRawNotes(r.notes)
-        setBpm(refineBpm(r.notes.map((n) => n.start), r.bpm))
+        // 节拍锁定度高(包络自相关跟住了全曲律动)→ 直接用;低 → 用音符起点网格搜索细化
+        setBpm(r.bpmStrength && r.bpmStrength > 0.2 ? r.bpm : refineBpm(r.notes.map((n) => n.start), r.bpm))
         autoSaveRef.current = true
-        autoNameRef.current = fileName.replace(/\(\d+(\.\d+)?s\)$/, '').trim() || '识别结果'
+        autoNameRef.current = name
         setVisibleBars(8)
         setStatus('done')
       } catch (e) {
         setStatus('error')
         const msg = String(e)
         if (msg.includes('WEBGL_HANG') || msg.includes('超时')) {
-          setErrMsg('AI 推理超时:已依次尝试 Worker-GPU、页面内 GPU 与 CPU 均未在时限内出结果。建议:① 用片段功能截取 1-2 分钟再扒;② 或改用内置 DSP 引擎。')
+          setErrMsg('AI 推理超时:已依次尝试 Worker-GPU、主线程 GPU 与并行 CPU 均未在时限内出结果。建议:① 用片段功能截取 1-2 分钟再扒;② 或改用内置 DSP 引擎。')
         } else {
           setErrMsg('Basic Pitch 引擎出错:' + msg + '。可切回内置 DSP 引擎重试。')
         }
@@ -316,11 +400,12 @@ export default function TranscribePage() {
           setErrMsg('没有识别出音符。建议:更接近吉他、单音旋律、减少背景噪声;或切换 Basic Pitch 引擎识别复音。')
           return
         }
+        shiftOrigin(r)
         setResult(r)
         setRawNotes(r.notes)
-        setBpm(refineBpm(r.notes.map((n) => n.start), r.bpm))
+        setBpm(r.bpmStrength && r.bpmStrength > 0.2 ? r.bpm : refineBpm(r.notes.map((n) => n.start), r.bpm))
         autoSaveRef.current = true
-        autoNameRef.current = fileName.replace(/\(\d+(\.\d+)?s\)$/, '').trim() || '识别结果'
+        autoNameRef.current = name
         setVisibleBars(8)
         setStatus('done')
       } else if (e.data.type === 'error') {
@@ -330,8 +415,8 @@ export default function TranscribePage() {
         setErrMsg('分析出错:' + e.data.message)
       }
     }
-    const ch = audio.getChannelData(0).slice()
-    worker.postMessage({ type: 'transcribe', channel: ch, sampleRate: audio.sampleRate }, [ch.buffer])
+    const ch = target.getChannelData(0).slice()
+    worker.postMessage({ type: 'transcribe', channel: ch, sampleRate: target.sampleRate }, [ch.buffer])
   }
 
   // ---------- 量化 + 指法 ----------
@@ -340,15 +425,29 @@ export default function TranscribePage() {
     if (!result) return
     const gridSec = 60 / bpm / SUBDIV
     const anchor = result.offset - offsetSteps * gridSec
-    const filtered = rawNotes.filter((n) => n.confidence >= minConf)
-    const q: { midi: number; step: number; dur: number }[] = []
+    // 自动密度:整曲混识别的音符量远超可读范围(几分钟的歌动辄数千个),
+    // 按响度升阈值只保留最响的主声部(≤3 音符/秒);手动阈值更高时以手动为准
+    let effMinConf = minConf
+    if (autoDensity && rawNotes.length > result.duration * 3) {
+      const target = Math.max(60, Math.ceil(result.duration * 3))
+      const sorted = rawNotes.map((n) => n.confidence).sort((a, b) => b - a)
+      const keep = Math.min(target, sorted.length)
+      effMinConf = Math.max(minConf, Math.min(0.85, sorted[keep - 1]))
+      setAutoDensityInfo(
+        `自动密度:响度阈值 ${minConf.toFixed(2)} → ${effMinConf.toFixed(2)},保留 ${keep}/${rawNotes.length} 个最响的音符`,
+      )
+    } else {
+      setAutoDensityInfo(null)
+    }
+    const filtered = rawNotes.filter((n) => n.confidence >= effMinConf)
+    const q: { midi: number; step: number; dur: number; conf: number }[] = []
     for (const n of filtered) {
       // 不 clamp 到 0:起音检测滞后时音符可以在锚点之前(往左对齐的物理基础)
       const step = Math.round((n.start - anchor) / gridSec)
       let dur = Math.round((n.end - n.start) / gridSec)
       dur = SNAP_DURS.reduce((best, d) => (Math.abs(d - dur) < Math.abs(best - dur) ? d : best), 3)
       dur = Math.max(2, dur)
-      q.push({ midi: n.midi, step, dur })
+      q.push({ midi: n.midi, step, dur, conf: n.confidence })
     }
     q.sort((a, b) => a.step - b.step)
     // 去掉完全同 step 同 midi 的重复
@@ -385,7 +484,17 @@ export default function TranscribePage() {
     } else {
       setSwingInfo(null)
     }
-    const { notes: tab, dropped } = assignFingering(dedup2, tuning, maxFret)
+    // 复音上限:同一格最多 6 个音(吉他弦数),混音识别的密集簇保留最响的
+    let finalQ = capPolyphony(dedup2, 6)
+    // 调外音过滤(可选):整曲混识别的差半音幻觉音大多在调外(布鲁斯音也会被滤,慎用)
+    if (keyFilter && keyGuess) {
+      const inKey = filterToKey(finalQ, keyGuess)
+      setKeyDropCount(finalQ.length - inKey.length)
+      finalQ = inKey
+    } else {
+      setKeyDropCount(0)
+    }
+    const { notes: tab, dropped } = assignFingering(finalQ, tuning, maxFret)
     nextIdRef.current = tab.length + 1
     setNotes(tab)
     setDroppedNotes(dropped)
@@ -408,7 +517,9 @@ export default function TranscribePage() {
     }
     rebuild()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [result, bpm, offsetSteps, minConf, maxFret, tuningId])
+  }, [result, bpm, offsetSteps, minConf, maxFret, tuningId, keyFilter, autoDensity])
+
+  const keyGuess = useMemo<KeyGuess | null>(() => detectKey(rawNotes), [rawNotes])
 
   const totalSteps = useMemo(
     () => Math.max(48, ...notes.map((n) => n.step + n.dur)),
@@ -687,7 +798,15 @@ export default function TranscribePage() {
             </>
           )}
           <div className="spacer" />
-          <button className="btn primary" disabled={!audio || status === 'working'} onClick={runTranscribe}>
+          <button
+            className="btn"
+            disabled={!audio || status === 'working'}
+            onClick={() => runTranscribe(true)}
+            title={`只识别「片段循环」选中的区间(当前 ${segStart.toFixed(1)}s 起 ${segLen.toFixed(1)}s)。整首歌建议分段扒,又快又准`}
+          >
+            ✂ 只扒片段
+          </button>
+          <button className="btn primary" disabled={!audio || status === 'working'} onClick={() => runTranscribe()}>
             {status === 'working'
               ? bpStage === 'model'
                 ? `⏳ 初始化 AI 引擎${bpBackend ? `(${bpBackend.startsWith('cpu') ? 'CPU' : bpBackend})` : '…'}`
@@ -705,6 +824,12 @@ export default function TranscribePage() {
               title="纯信号处理,零模型加载,适合单音旋律">⚡ 内置 DSP(离线 · 单音)</button>
             <button className={`chip${engine === 'bp' ? ' active' : ''}`} onClick={() => switchEngine('bp')}
               title="Spotify Basic Pitch 神经网络,支持和弦等复音;首次使用需加载 AI 引擎(约 2MB,之后有缓存)">🧠 Basic Pitch(复音 · AI)</button>
+            {audio && audio.numberOfChannels >= 2 && (
+              <button className={`chip${vocalCut ? ' active' : ''}`} onClick={() => setVocalCut(!vocalCut)}
+                title="立体声中置相消:消掉居中的人声/贝斯/军鼓,保留左右声道的吉他。双轨吉他的摇滚/流行曲(整曲一次扒)建议开启;独奏居中的歌请关闭">
+                🎤 人声消除{vocalCut ? '开' : '关'}
+              </button>
+            )}
           </div>
           {engine === 'bp' && (
             <>
@@ -735,7 +860,7 @@ export default function TranscribePage() {
         )}
         {engine === 'bp' && audio && audio.duration > 240 && status !== 'done' && (
           <div className="warn-box mt">
-            音频较长({Math.round(audio.duration / 60)} 分钟):AI 推理与音符提取耗时随长度增长,建议先用下方「片段」功能截取 1-2 分钟分段扒谱,再逐段核对。
+            音频较长({Math.round(audio.duration / 60)} 分钟):可以整曲一次扒——建议开启 <b>🎤 人声消除</b>(立体声)并保持 <b>🎚 自动密度</b> + <b>🎹 调性过滤</b>,识别后先用 A/B 对比核对;想要更精细的主音轨,用 <b>✂ 只扒片段</b> 分段扒。
           </div>
         )}
       </div>
@@ -753,7 +878,7 @@ export default function TranscribePage() {
                 }} style={{ width: 150 }} />
             </label>
             <label className="field">长度 {segLen.toFixed(1)}s
-              <input type="range" min={0.5} max={Math.max(0.6, Math.min(8, audio.duration - segStart))} step={0.1} value={segLen}
+              <input type="range" min="0.5" max={Math.max(0.6, Math.min(120, audio.duration - segStart))} step="0.1" value={segLen}
                 onChange={(e) => setSegLen(parseFloat(e.target.value))} style={{ width: 130 }} />
             </label>
             <button className={`btn ${looping ? 'primary playing' : ''}`} onClick={toggleLoop}>
@@ -770,7 +895,7 @@ export default function TranscribePage() {
           </div>
           <div className="muted small mt">
             A/B 对比 = 先播原音频片段、紧接播放谱面合成(背靠背两轮),用于核对扒谱是否准确;循环原片段适合跟练。
-            {result ? '选中谱面音符后可一键定位片段。' : '(识别后可用对比功能)'}
+            {result ? '选中谱面音符后可一键定位片段。' : '(识别后可用对比功能)。'}长度可拉到 120s,选好区间后点上方 <b>✂ 只扒片段</b> 即只识别这一段(整首歌建议分段扒)。
           </div>
         </div>
       )}
@@ -830,7 +955,7 @@ export default function TranscribePage() {
                   </div>
                 </label>
                 <label className="field">{engine === 'bp' ? `响度 ≥ ${minConf.toFixed(2)}` : `置信度 ≥ ${minConf.toFixed(2)}`}
-                  <input type="range" min="0.3" max="0.95" step="0.05" value={minConf}
+                  <input type="range" min="0.05" max="0.95" step="0.05" value={minConf}
                     onChange={(e) => setMinConf(parseFloat(e.target.value))} style={{ width: 130 }} />
                 </label>
                 <label className="field">最高品
@@ -843,9 +968,30 @@ export default function TranscribePage() {
                     {TUNINGS.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
                   </select>
                 </label>
+                <button
+                  className={`chip${keyFilter ? ' active' : ''}`}
+                  onClick={() => setKeyFilter(!keyFilter)}
+                  disabled={!keyGuess}
+                  title={`按检测到的调性(${keyGuess?.name ?? '样本不足'})过滤调外音:整曲混识别里差半音的幻觉音大多在调外;注意布鲁斯音/离调经过音也会被滤掉`}
+                >
+                  🎹 调性过滤{keyFilter ? '开' : '关'}{keyGuess ? `(${keyGuess.name})` : ''}
+                </button>
+                <button
+                  className={`chip${autoDensity ? ' active' : ''}`}
+                  onClick={() => setAutoDensity(!autoDensity)}
+                  title="音符过多时按响度自动升阈值,只保留最响的主声部(≤3 音符/秒)——整曲一次扒建议开启"
+                >
+                  🎚 自动密度{autoDensity ? '开' : '关'}
+                </button>
               </div>
+              {autoDensityInfo && (
+                <div className="muted small mt" style={{ marginBottom: 4 }}>{autoDensityInfo}</div>
+              )}
               <div className="muted small mt">
-                识别到 {rawNotes.length} 个音符{engine === 'bp' ? '(复音,含同时发声;响度过滤会删掉弱奏音,慎用)' : ''} · 平均置信度 {(avgConf * 100).toFixed(0)}% · 建议先核对节奏(用◀▶对齐第一拍)。结果<b>已自动保存到下方曲库</b>(同名覆盖),刷新不丢;调整参数会重建谱面并更新曲库。
+                识别到 {rawNotes.length} 个音符{engine === 'bp' ? '(复音,含同时发声;响度过滤会删掉弱奏音,慎用)' : ''} · 平均置信度 {(avgConf * 100).toFixed(0)}%
+                {result.bpmStrength ? ` · 节拍锁定 ${(result.bpmStrength * 100).toFixed(0)}%(${bpm} BPM)` : ''}
+                {keyGuess ? ` · 检测调性 ${keyGuess.name}` : ''}
+                {keyFilter && keyDropCount > 0 ? ` · 调性过滤删掉 ${keyDropCount} 个调外音` : ''} · 建议先核对节奏(用◀▶对齐第一拍)。结果<b>已自动保存到下方曲库</b>(同名覆盖),刷新不丢;调整参数会重建谱面并更新曲库。
               </div>
               {swingInfo && (
                 <div className="mt" style={{ background: 'rgba(124,108,240,0.1)', border: '1px solid rgba(124,108,240,0.35)', borderRadius: 10, padding: '8px 12px', color: 'var(--accent2)', fontSize: 13 }}>

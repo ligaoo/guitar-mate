@@ -10,7 +10,7 @@ import { setMasterVolume } from './audio/engine'
 type PageId = 'chords' | 'ear' | 'tuner' | 'transcribe' | 'tone' | 'pitch'
 
 const PAGES: { id: PageId; name: string; icon: string; desc: string }[] = [
-  { id: 'chords', name: '和弦图', icon: '🎸', desc: '查询和弦指法 · 试听 · 按指法反查和弦名' },
+  { id: 'chords', name: '和弦图', icon: '🎸', desc: '查询和弦指法 · 试听 · 按指法反查 · 随机考试' },
   { id: 'ear', name: '练耳', icon: '👂', desc: '音程 · 和弦 · 音阶 · 旋律 · 节奏,自适应难度' },
   { id: 'tuner', name: '调音器', icon: '🎛️', desc: '实时音高检测,支持多种调弦' },
   { id: 'transcribe', name: '自动扒谱', icon: '🎧', desc: '音频 → 六线谱,可编辑、试听、导出' },
@@ -65,7 +65,7 @@ export default function App() {
         <h1 className="page-title">{meta.name}</h1>
         <p className="page-desc">{meta.desc}</p>
         {/* 所有页面常驻挂载、仅隐藏切换:切页不销毁进行中的扒谱/录音等状态 */}
-        <div style={{ display: page === 'chords' ? 'block' : 'none' }}><ChordsPage /></div>
+        <div style={{ display: page === 'chords' ? 'block' : 'none' }}><ChordsPage active={page === 'chords'} /></div>
         <div style={{ display: page === 'ear' ? 'block' : 'none' }}><EarTrainingPage active={page === 'ear'} /></div>
         <div style={{ display: page === 'tuner' ? 'block' : 'none' }}><TunerPage /></div>
         <div style={{ display: page === 'transcribe' ? 'block' : 'none' }}><TranscribePage /></div>

@@ -20,6 +20,7 @@ export interface TranscribeResult {
   duration: number
   f0Track: Float32Array // 每 hop 一帧的 f0(0=无),供 UI 画音高轨迹
   likelyPolyphonic?: boolean // DSP 路径的复音疑似标记(建议切换 Basic Pitch)
+  bpmStrength?: number // 节拍锁定度 0-1(包络自相关峰值归一化),高=可信
 }
 
 export function toMono(channels: Float32Array[], length: number): Float32Array {
@@ -381,9 +382,68 @@ export function estimateBpm(onsets: number[]): { bpm: number } {
   return { bpm: Math.max(30, Math.min(300, Math.round(bpmOf(period)))) }
 }
 
+/** 起音包络自相关 BPM 估计:整曲节拍(跟鼓点/和声律动)比"音符汤间隔直方图"稳健得多。
+ *  包络去均值 → 自相关(滞后 ≈ 30-225 BPM)→ 平滑找峰 → 90-180 BPM 先验 → 半速倍频仲裁。
+ *  strength = 最优滞后处的自相关值 / 方差(≈ lag0),~0.1 以上视为节拍锁定。 */
+export function estimateBpmFromEnvelope(env: Float32Array, fps: number): { bpm: number; strength: number } {
+  const n = env.length
+  if (n < fps * 2) return { bpm: 0, strength: 0 }
+  let mean = 0
+  for (let i = 0; i < n; i++) mean += env[i]
+  mean /= n
+  let varr = 0
+  for (let i = 0; i < n; i++) varr += (env[i] - mean) * (env[i] - mean)
+  if (varr < 1e-9) return { bpm: 0, strength: 0 }
+  const minLag = Math.max(2, Math.floor((60 / 225) * fps))
+  const maxLag = Math.min(n - 2, Math.ceil((60 / 30) * fps))
+  const ac = new Float32Array(maxLag + 1)
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let s = 0
+    for (let i = 0; i + lag < n; i++) s += (env[i] - mean) * (env[i + lag] - mean)
+    ac[lag] = s / (n - lag)
+  }
+  // 3 点平滑抑制单帧毛刺
+  const sm = new Float32Array(maxLag + 1)
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    sm[lag] =
+      ((ac[lag - 1] ?? 0) + 2 * ac[lag] + (ac[lag + 1] ?? 0)) / 4
+  }
+  // 局部极大候选峰,按值排序
+  const peaks: { lag: number; v: number }[] = []
+  for (let lag = minLag + 1; lag < maxLag; lag++) {
+    if (sm[lag] > sm[lag - 1] && sm[lag] >= sm[lag + 1] && sm[lag] > 0) peaks.push({ lag, v: sm[lag] })
+  }
+  if (peaks.length === 0) return { bpm: 0, strength: 0 }
+  peaks.sort((a, b) => b.v - a.v)
+  // 先验:最强 10 个峰里优先 90-180 BPM(常见歌曲节拍区间),没有再退回全局最强
+  const top = peaks.slice(0, 10)
+  const inRange = top.filter((p) => {
+    const b = (60 * fps) / p.lag
+    return b >= 90 && b <= 180
+  })
+  const best = inRange.length ? inRange[0] : top[0]
+  // 倍频仲裁:若半周期处(lag/2)也有相当强度的峰,取更快的那个(避免半速)
+  let lag = best.lag
+  while (lag / 2 >= minLag) {
+    const half = Math.floor(lag / 2)
+    const halfV = sm[half]
+    if (halfV >= sm[lag] * 0.72 && halfV > (sm[half - 1] ?? 0) && halfV >= (sm[half + 1] ?? 0)) {
+      lag = half
+    } else break
+  }
+  // 亚帧精度:对原始自相关峰做抛物线插值(整数滞后在快歌处每帧 ≈ ±3 BPM,插值后 <0.5)
+  const y0 = ac[lag - 1] ?? 0
+  const y1 = ac[lag]
+  const y2 = ac[lag + 1] ?? 0
+  const denom = y0 - 2 * y1 + y2
+  const delta = denom !== 0 ? (0.5 * (y0 - y2)) / denom : 0
+  const lagFine = lag + Math.max(-0.5, Math.min(0.5, delta))
+  const bpm = (60 * fps) / lagFine
+  return { bpm: Math.max(30, Math.min(300, Math.round(bpm))), strength: Math.max(0, Math.min(1, sm[lag] / (varr / n))) }
+}
+
 /** 主入口:完整管线 */
-export function transcribe(monoData: Float32Array, srIn: number): TranscribeResult {
-  const resampled = normalize(resampleLinear(monoData, srIn, SR))
+export function transcribe(monoData: Float32Array, srIn: number): TranscribeResult {  const resampled = normalize(resampleLinear(monoData, srIn, SR))
   const duration = resampled.length / SR
   // 前置补零:保证信号开头的起音有"静音 → 发声"的对比帧可检
   const padded = new Float32Array(WIN + resampled.length)
