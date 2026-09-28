@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
-const tests = ['test-sanity.ts', 'test-tone.ts', 'test-pitch.ts', 'test-cleanup.ts', 'test-loudness.ts']
+const tests = ['test-sanity.ts', 'test-tone.ts', 'test-pitch.ts', 'test-cleanup.ts', 'test-loudness.ts', 'test-onset.ts', 'test-separation.ts', 'test-bp-post.ts']
 let failed = false
 for (const t of tests) {
   const out = `.test-${t.replace('.ts', '')}.cjs`

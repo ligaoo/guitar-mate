@@ -9,13 +9,13 @@
 import { toMono, resampleLinear, estimateBpm, estimateBpmFromEnvelope, SR, type TranscribeResult, type RawNote } from './pipeline'
 
 // 模型路径按运行上下文解析:页面里相对页面(支持子路径部署);
-// Worker 里相对 worker 脚本(位于 assets/ 下,回退一级)
+// Worker 里相对 worker 脚本(位于 assets/ 下,回退一级);
+// Node(离线评估脚本)下无 document/self,退化为相对路径,由调用方传入 modelUrl
 const MODEL_URL = (() => {
   const rel = 'vendor/basic-pitch/model.json'
-  if (typeof window === 'undefined') {
-    return new URL('../' + rel, self.location.href).href
-  }
-  return new URL(rel, document.baseURI).href
+  if (typeof document !== 'undefined') return new URL(rel, document.baseURI).href
+  if (typeof self !== 'undefined' && self.location) return new URL('../' + rel, self.location.href).href
+  return rel
 })()
 
 type BpModule = typeof import('@spotify/basic-pitch')
@@ -25,9 +25,12 @@ export interface BpOptions {
   frameThresh?: number // 延音阈值(默认 0.2)
   minNoteLenFrames?: number // 最短音符(帧,86fps;默认 12 ≈ 140ms,16 分音符可检出)
   removeOctaveGhosts?: boolean // 去除同时段的八度重影(默认开;和弦含真八度时应关闭)
+  mergeSplits?: boolean // 合并同一音高、首尾相接的被拆音符(默认开)
   forceCpu?: boolean // 跳过 WebGL 直接用 CPU(看门狗回退 / 并行模式)
   modelUrl?: string // 模型地址:由主线程按页面地址解析后传给 worker(dev 与构建环境统一)
   minHz?: number // 音域下限(默认 70Hz ≈ Drop D 的 D2):整曲混识别时切掉贝斯/底鼓
+  lowestMidi?: number // MIDI 音域下限(默认 36):按调弦传入可保住 Drop D/DADGAD 的低音 D2=38
+  highestMidi?: number // MIDI 音域上限(默认 90):按调弦+最高品传入
   maxHz?: number // 音域上限(默认 1350Hz ≈ 22 品高音弦):切掉镲片泛音等超声垃圾
 }
 
@@ -122,7 +125,7 @@ async function mainGlHealthCheck(): Promise<boolean> {
 /** 分块推理:60s 一块,块间带一个窗口的重叠上下文并裁掉越界帧。
  *  避免长音频一次性构建 (总时长×86 帧) 的巨型张量;每块结束让出事件循环,
  *  主线程混合模式下进度得以刷新。 */
-async function evaluateChunked(
+export async function evaluateChunked(
   bp: InstanceType<BpModule['BasicPitch']>,
   pcm: Float32Array,
   onProgress: BpProgress,
@@ -191,8 +194,9 @@ export async function postProcessFrames(
       confidence: Math.max(0, Math.min(1, n.amplitude)),
       velocity: Math.max(0, Math.min(1, n.amplitude)),
     }))
-    .filter((n) => n.midi >= 40 && n.midi <= 88)
+    .filter((n) => n.midi >= (opts.lowestMidi ?? 36) && n.midi <= (opts.highestMidi ?? 90))
   notes.sort((a, b) => a.start - b.start || a.midi - b.midi)
+  if (opts.mergeSplits !== false) notes = mergeAdjacentSamePitch(notes)
   if (opts.removeOctaveGhosts !== false) notes = removeOctaveGhosts(notes)
   const onsetsT = [...new Set(notes.map((n) => +n.start.toFixed(3)))].sort((a, b) => a - b)
   // 整曲节拍:起音包络自相关(跟全曲律动,含鼓点驱动的起音),锁定不住再退回音符间隔直方图
@@ -267,7 +271,7 @@ export async function transcribeWithBasicPitchChannels(
  * 八度重影过滤:模型常见的「同一时间出现基频 + 高/低八度」幻觉。
  * 时间重叠超过较短音符 50% 且音高差恰为 12/24 半音 → 保留响度大的那个。
  */
-function removeOctaveGhosts(notes: RawNote[]): RawNote[] {
+export function removeOctaveGhosts(notes: RawNote[]): RawNote[] {
   const dead = new Set<number>()
   for (let i = 0; i < notes.length; i++) {
     if (dead.has(i)) continue
@@ -286,6 +290,39 @@ function removeOctaveGhosts(notes: RawNote[]): RawNote[] {
     }
   }
   return notes.filter((_, i) => !dead.has(i))
+}
+
+/**
+ * 合并「同一音高、首尾相接」的相邻音符。
+ *
+ * 动机(实测):melodia 后处理会把一个持续音拆成两段——音尾衰减时该音高的帧激活
+ * 跌破阈值、随后又回升,于是同一个音在谱面上被写成两个。合成单声部样例上
+ * 56 个标注音被输出成 114 个,其中绝大多数就是这种同音高紧邻的碎片。
+ *
+ * 判据刻意保守:音高完全相同、后段起点不早于前段起点、且间隔 ≤ gapSec。
+ * 真正的同音重复(re-articulation)会因起音与衰减包络留下明显间隔,不会被并入。
+ */
+export function mergeAdjacentSamePitch(notes: RawNote[], gapSec = 0.03): RawNote[] {
+  const sorted = [...notes].sort((a, b) => a.start - b.start || a.midi - b.midi)
+  const out: RawNote[] = []
+  // 按音高各自记录"最近一段"的位置:若只跟排序后紧邻的上一个音比较,
+  // 中间夹进一个别的音高就会断链(延音 A 还没结束时 B 起音,再出现 A 的碎片)。
+  const lastIdxByMidi = new Map<number, number>()
+  for (const n of sorted) {
+    const li = lastIdxByMidi.get(n.midi)
+    if (li !== undefined) {
+      const last = out[li]
+      if (n.start >= last.start && n.start - last.end <= gapSec) {
+        last.end = Math.max(last.end, n.end)
+        last.confidence = Math.max(last.confidence, n.confidence)
+        last.velocity = Math.max(last.velocity, n.velocity)
+        continue
+      }
+    }
+    out.push({ ...n })
+    lastIdxByMidi.set(n.midi, out.length - 1)
+  }
+  return out
 }
 
 // ---------- Worker 编排 ----------

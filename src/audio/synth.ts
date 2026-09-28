@@ -13,8 +13,15 @@ export interface PluckOptions {
 const bufferCache = new Map<string, AudioBuffer>()
 const CACHE_LIMIT = 220
 
-/** 纯 DSP:渲染一个拨弦波形(供 makePluckBuffer 与测试使用,不依赖 AudioContext) */
-export function renderPluckSamples(freq: number, sr: number, dur: number, brightness: number): Float32Array {
+/** 纯 DSP:渲染一个拨弦波形(供 makePluckBuffer 与测试使用,不依赖 AudioContext)。
+ *  rng 可注入:评估样例需要可复现的音频(默认 Math.random,浏览器行为不变)。 */
+export function renderPluckSamples(
+  freq: number,
+  sr: number,
+  dur: number,
+  brightness: number,
+  rng: () => number = Math.random,
+): Float32Array {
   // 延迟线长度取整会带来最高十几个音分的失谐(多弦和弦时会"发酸"),
   // 改用小数周期 + 线性插值读出;0.5 为回写一阶平均滤波的群延迟,预先补偿
   const period = sr / freq - 0.5
@@ -31,7 +38,7 @@ export function renderPluckSamples(freq: number, sr: number, dur: number, bright
   let lp = 0
   const a = Math.min(0.9, Math.max(0.06, (2 * Math.PI * 8 * freq) / sr)) * (0.2 + 0.8 * brightness)
   for (let i = 0; i <= N; i++) {
-    const w = Math.random() * 2 - 1
+    const w = rng() * 2 - 1
     lp += a * (w - lp)
     delay[i] = brightness > 0.98 ? w : lp
   }

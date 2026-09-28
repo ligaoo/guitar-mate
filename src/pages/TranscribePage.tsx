@@ -6,6 +6,7 @@ import { assignFingering, type TabNote, type DroppedNote } from '../transcriptio
 import { tabToText, tabToMidi, downloadBlob } from '../transcription/exporters'
 import { transcribeWithBasicPitch } from '../transcription/basicPitch'
 import { detectKey, filterToKey, capPolyphony, type KeyGuess } from '../transcription/cleanup'
+import { separateBuffer } from '../transcription/preprocess'
 import TabView from '../components/TabView'
 import { GuitarSynth } from '../audio/synth'
 import { getCtx, getMaster } from '../audio/engine'
@@ -70,7 +71,10 @@ export default function TranscribePage() {
   const [keyDropCount, setKeyDropCount] = useState(0)
   const [autoDensity, setAutoDensity] = useState(true) // 自动密度:音符过多时按响度自动升阈值(整曲一次扒的关键)
   const [autoDensityInfo, setAutoDensityInfo] = useState<string | null>(null)
-  const [vocalCut, setVocalCut] = useState(false) // 中置声道相消:消掉居中的人声/贝斯,保留左右声道的吉他
+  const [separate, setSeparate] = useState(false) // 分轨预处理:HPSS 去鼓 + 中侧 + 低频切除
+  const [centerSuppress, setCenterSuppress] = useState(0.6) // 中置抑制强度(双轨吉他分居左右的混音开启)
+  const [sepProgress, setSepProgress] = useState<number | null>(null)
+  const [sepInfo, setSepInfo] = useState<string | null>(null)
   // A/B 片段
   const [segStart, setSegStart] = useState(0)
   const [segLen, setSegLen] = useState(4)
@@ -188,32 +192,6 @@ export default function TranscribePage() {
     return out
   }
 
-  /** 中置声道相消(立体声):side = (L-R)/2,居中的人声/贝斯/军鼓被消掉,
-   *  左右声道的吉他(双轨失真吉他在摇滚混音里几乎必分左右)保留。近单声道返回 null。 */
-  const centerCancelBuffer = (buf: AudioBuffer): AudioBuffer | null => {
-    if (buf.numberOfChannels < 2) return null
-    const ctx = getCtx()
-    const L = buf.getChannelData(0)
-    const R = buf.getChannelData(1)
-    const out = ctx.createBuffer(1, buf.length, buf.sampleRate)
-    const o = out.getChannelData(0)
-    let sideE = 0
-    let midE = 0
-    for (let i = 0; i < buf.length; i++) {
-      const side = (L[i] - R[i]) * 0.5
-      o[i] = side
-      sideE += side * side
-      const mid = (L[i] + R[i]) * 0.5
-      midE += mid * mid
-    }
-    // 相消后能量不足原信号的 1%:说明内容几乎全在中置,相消只会得到静音
-    if (sideE < midE * 0.01) return null
-    // 响度回补(side 通常比原 mix 轻不少)
-    const rms = Math.sqrt(sideE / buf.length)
-    const g = Math.min(8, 0.25 / Math.max(1e-6, rms))
-    for (let i = 0; i < buf.length; i++) o[i] *= g
-    return out
-  }
 
   const loadFile = async (file: File) => {
     stopPlayback()
@@ -231,6 +209,7 @@ export default function TranscribePage() {
       // 单音 DSP 引擎对整首歌只会输出垃圾;录音(现场单音)则默认 DSP
       setEngine('bp')
       setMinConf(0.25)
+      setSeparate(true) // 导入的音频几乎都是完整混音,默认开启分轨预处理
     } catch {
       setErrMsg('无法解码该音频文件,请换 mp3/wav/m4a 格式。')
       setStatus('error')
@@ -258,6 +237,7 @@ export default function TranscribePage() {
       // 麦克风现场录音通常是单音演奏:默认 DSP(零模型加载,秒出)
       setEngine('dsp')
       setMinConf(0.55)
+      setSeparate(false)
       stopLoop()
       setSegStart(0)
       setSegLen(Math.min(4, buf.duration))
@@ -318,20 +298,30 @@ export default function TranscribePage() {
     let target = audio
     let origin = 0
     let name = fileName.replace(/\(\d+(\.\d+)?s\)$/, '').trim() || '识别结果'
-    if (vocalCut) {
-      const cut = centerCancelBuffer(audio)
-      if (!cut) {
-        setStatus('error')
-        setErrMsg('人声消除无效:该音频左右声道几乎相同(单声道内容),相消后只剩静音。请关闭「🎤 人声消除」后重试。')
-        return
-      }
-      target = cut
-    }
     if (segment) {
       const len = Math.max(0.5, Math.min(segLen, audio.duration - segStart))
       target = sliceAudio(target, segStart, len)
       origin = segStart
       name = `${name}·片段${segStart.toFixed(0)}s`
+    }
+    // 分轨预处理放在片段截取之后:整曲扒谱时只对需要区间做分离,快很多。
+    // 输出 AudioBuffer 与输入等长等采样率,下游时间换算无需改动。
+    if (separate) {
+      setSepProgress(0)
+      setSepInfo(null)
+      try {
+        const { promise } = separateBuffer(target, { centerSuppress }, (pp) => setSepProgress(pp))
+        const res = await promise
+        target = res.buffer
+        const share = res.energy.total > 0 ? res.energy.guitar / res.energy.total : 0
+        setSepInfo(`分轨预处理:吉他优先信号占提取能量 ${(share * 100).toFixed(0)}%`)
+      } catch (e) {
+        setSepProgress(null)
+        setStatus('error')
+        setErrMsg('分轨预处理失败:' + String(e) + '。可关闭「🎛 分轨预处理」后重试。')
+        return
+      }
+      setSepProgress(null)
     }
     // 把片段内的时间(0 起)平移为原音频的绝对时间:A/B 对比、定位选中音直接可用
     const shiftOrigin = (r: TranscribeResult) => {
@@ -349,7 +339,14 @@ export default function TranscribePage() {
       try {
         const r = await transcribeWithBasicPitch(
           target,
-          { onsetThresh, frameThresh, removeOctaveGhosts: ghostFilter },
+          {
+            onsetThresh,
+            frameThresh,
+            removeOctaveGhosts: ghostFilter,
+            // 按当前调弦收紧音域:标准调弦下限 40(E2),Drop D/DADGAD 是 38(D2)
+            lowestMidi: tuning[0],
+            highestMidi: tuning[tuning.length - 1] + maxFret,
+          },
           (p) => setBpProgress(p),
           (stage, info) => {
             setBpStage(stage)
@@ -415,7 +412,13 @@ export default function TranscribePage() {
         setErrMsg('分析出错:' + e.data.message)
       }
     }
-    const ch = target.getChannelData(0).slice()
+    // 原先只取 0 声道:硬右声像的内容对 DSP 管线完全不可见。改为各声道等权求和。
+    const nCh = Math.max(1, target.numberOfChannels)
+    const ch = new Float32Array(target.length)
+    for (let c = 0; c < nCh; c++) {
+      const src = target.getChannelData(c)
+      for (let i = 0; i < src.length; i++) ch[i] += src[i] / nCh
+    }
     worker.postMessage({ type: 'transcribe', channel: ch, sampleRate: target.sampleRate }, [ch.buffer])
   }
 
@@ -824,11 +827,17 @@ export default function TranscribePage() {
               title="纯信号处理,零模型加载,适合单音旋律">⚡ 内置 DSP(离线 · 单音)</button>
             <button className={`chip${engine === 'bp' ? ' active' : ''}`} onClick={() => switchEngine('bp')}
               title="Spotify Basic Pitch 神经网络,支持和弦等复音;首次使用需加载 AI 引擎(约 2MB,之后有缓存)">🧠 Basic Pitch(复音 · AI)</button>
-            {audio && audio.numberOfChannels >= 2 && (
-              <button className={`chip${vocalCut ? ' active' : ''}`} onClick={() => setVocalCut(!vocalCut)}
-                title="立体声中置相消:消掉居中的人声/贝斯/军鼓,保留左右声道的吉他。双轨吉他的摇滚/流行曲(整曲一次扒)建议开启;独奏居中的歌请关闭">
-                🎤 人声消除{vocalCut ? '开' : '关'}
+            {audio && (
+              <button className={`chip${separate ? ' active' : ''}`} onClick={() => setSeparate(!separate)}
+                title="分轨预处理:HPSS 去掉鼓的瞬态、中侧分解压低居中的内容、切除 70Hz 以下(贝斯基频的谐波会变成幽灵音)。整曲扒谱强烈建议开启;独奏/现场录音可关闭">
+                🎛 分轨预处理{separate ? '开' : '关'}
               </button>
+            )}
+            {audio && separate && (
+              <label className="field">中置抑制 {centerSuppress.toFixed(1)}
+                <input type="range" min="0" max="0.9" step="0.1" value={centerSuppress}
+                  onChange={(e) => setCenterSuppress(parseFloat(e.target.value))} style={{ width: 120 }} />
+              </label>
             )}
           </div>
           {engine === 'bp' && (
@@ -849,6 +858,11 @@ export default function TranscribePage() {
           )}
         </div>
         {status === 'error' && <div className="warn-box mt">{errMsg}</div>}
+        {status === 'working' && sepProgress !== null && (
+          <div className="muted small mt">
+            🎛 分轨预处理中 {(sepProgress * 100).toFixed(0)}%(HPSS 中值滤波 + 中侧分解,在 Worker 里跑,页面不卡)
+          </div>
+        )}
         {status === 'working' && (
           <div className="muted small mt">
             {engine === 'bp'
@@ -860,7 +874,7 @@ export default function TranscribePage() {
         )}
         {engine === 'bp' && audio && audio.duration > 240 && status !== 'done' && (
           <div className="warn-box mt">
-            音频较长({Math.round(audio.duration / 60)} 分钟):可以整曲一次扒——建议开启 <b>🎤 人声消除</b>(立体声)并保持 <b>🎚 自动密度</b> + <b>🎹 调性过滤</b>,识别后先用 A/B 对比核对;想要更精细的主音轨,用 <b>✂ 只扒片段</b> 分段扒。
+            音频较长({Math.round(audio.duration / 60)} 分钟):可以整曲一次扒——建议开启 <b>🎛 分轨预处理</b> 并保持 <b>🎚 自动密度</b> + <b>🎹 调性过滤</b>,识别后先用 A/B 对比核对;想要更精细的主音轨,用 <b>✂ 只扒片段</b> 分段扒(分轨只对片段做,快很多)。
           </div>
         )}
       </div>
@@ -991,6 +1005,7 @@ export default function TranscribePage() {
                 识别到 {rawNotes.length} 个音符{engine === 'bp' ? '(复音,含同时发声;响度过滤会删掉弱奏音,慎用)' : ''} · 平均置信度 {(avgConf * 100).toFixed(0)}%
                 {result.bpmStrength ? ` · 节拍锁定 ${(result.bpmStrength * 100).toFixed(0)}%(${bpm} BPM)` : ''}
                 {keyGuess ? ` · 检测调性 ${keyGuess.name}` : ''}
+                {sepInfo ? ` · ${sepInfo}` : ''}
                 {keyFilter && keyDropCount > 0 ? ` · 调性过滤删掉 ${keyDropCount} 个调外音` : ''} · 建议先核对节奏(用◀▶对齐第一拍)。结果<b>已自动保存到下方曲库</b>(同名覆盖),刷新不丢;调整参数会重建谱面并更新曲库。
               </div>
               {swingInfo && (

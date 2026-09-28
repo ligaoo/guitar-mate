@@ -12,7 +12,9 @@
     "host": "npm run build && vite preview --host --port 4173",
     "serve:subpath": "node scripts/serve-subpath.mjs",
     "icons": "node scripts/gen-icons.mjs",
-    "test": "node scripts/run-tests.mjs"
+    "test": "node scripts/run-tests.mjs",
+    "eval": "node scripts/eval-transcription.mjs",
+    "eval:bp": "node scripts/eval-transcription.mjs --engine=bp"
   },
   "dependencies": {
     "@spotify/basic-pitch": "^1.0.1",

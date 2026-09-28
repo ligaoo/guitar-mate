@@ -58,6 +58,9 @@ function normalize(data: Float32Array): Float32Array {
 
 const WIN = 1024
 const HOP = 256
+// 分析前在信号前补 WIN 个采样(让开头的起音有"静音 → 发声"的对比帧可检)。
+// 所有"帧序号 → 时间"的换算都必须减去这个偏移,否则整谱的起音会系统性偏晚约 46ms。
+const PAD_SEC = WIN / SR
 
 function stftMags(data: Float32Array): { mags: Float32Array[]; rms: Float32Array; times: Float32Array } {
   const win = new Float32Array(WIN)
@@ -87,7 +90,7 @@ function stftMags(data: Float32Array): { mags: Float32Array[]; rms: Float32Array
   return { mags, rms, times }
 }
 
-function fftInPlace(re: Float32Array, im: Float32Array): void {
+export function fftInPlace(re: Float32Array, im: Float32Array): void {
   const n = re.length
   for (let i = 1, j = 0; i < n; i++) {
     let bit = n >> 1
@@ -155,7 +158,7 @@ function detectOnsets(mags: Float32Array[], rms: Float32Array): number[] {
       // 抛物线插值细化峰值位置:把帧量化的 ±半帧(≈±6ms)误差降到 ±2ms 左右
       const denom = flux[f - 1] - 2 * flux[f] + flux[f + 1]
       const delta = denom !== 0 ? (0.5 * (flux[f - 1] - flux[f + 1])) / denom : 0
-      const t = ((f + Math.max(-0.5, Math.min(0.5, delta))) * HOP + WIN / 2) / SR
+      const t = ((f + Math.max(-0.5, Math.min(0.5, delta))) * HOP + WIN / 2) / SR - PAD_SEC
       if (t - lastT >= 0.07) {
         onsets.push(t)
         lastT = t
@@ -212,7 +215,7 @@ function trackF0(data: Float32Array): Float32Array {
   return out
 }
 
-const frameTime = (f: number) => (f * HOP + 1536 / 2) / SR
+const frameTime = (f: number) => (f * HOP + 1536 / 2) / SR - PAD_SEC
 
 // ---- 分割 ----
 
@@ -244,7 +247,7 @@ function segmentNotes(onsets: number[], f0: Float32Array, rms: Float32Array, dur
     // 结束时间:段内最后一个有声帧(能量阈值)
     let lastVoiced = t0
     for (let f = 0; f < rms.length; f++) {
-      const t = (f * HOP + WIN / 2) / SR
+      const t = (f * HOP + WIN / 2) / SR - PAD_SEC
       if (t >= t0 && t < t1 && rms[f] > 0.02) lastVoiced = t
     }
     const start = t0
@@ -252,7 +255,7 @@ function segmentNotes(onsets: number[], f0: Float32Array, rms: Float32Array, dur
     if (end - start < 0.07) continue
     let vel = 0
     for (let f = 0; f < rms.length; f++) {
-      const t = (f * HOP + WIN / 2) / SR
+      const t = (f * HOP + WIN / 2) / SR - PAD_SEC
       if (t >= start && t < start + 0.08) vel = Math.max(vel, rms[f])
     }
     notes.push({
@@ -454,7 +457,7 @@ export function transcribe(monoData: Float32Array, srIn: number): TranscribeResu
   let firstSound = -1
   for (let f = 0; f < rms.length; f++) {
     if (rms[f] > 0.02) {
-      firstSound = (f * HOP + WIN / 2) / SR
+      firstSound = (f * HOP + WIN / 2) / SR - PAD_SEC
       break
     }
   }

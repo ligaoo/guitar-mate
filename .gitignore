@@ -4,3 +4,4 @@ public/sw.js
 public/vendor/
 *.cjs
 *.log
+.eval/
