@@ -34,7 +34,7 @@ function hintOfChoice(kind: EarKind, choice: string): string {
   return ''
 }
 
-export default function EarTrainingPage() {
+export default function EarTrainingPage({ active = true }: { active?: boolean }) {
   const [kind, setKind] = useState<EarKind>('interval')
   const [stats, setStats] = useState<EarStats>(() => loadStats())
   const [q, setQ] = useState<Question | null>(null)
@@ -102,10 +102,10 @@ export default function EarTrainingPage() {
     })
   }
 
-  // 键盘:数字作答 / Backspace 删除 / Enter 下一题 / 空格重播
+  // 键盘:数字作答 / Backspace 删除 / Enter 下一题 / 空格重播(页面隐藏时不抢按键)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!q) return
+      if (!active || !q) return
       const target = e.target as HTMLElement | null
       if (target && ['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) return
       if (answered && e.key === 'Enter') {

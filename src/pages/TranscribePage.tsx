@@ -148,6 +148,18 @@ export default function TranscribePage() {
     [],
   )
 
+  // 识别进行中 / 有未保存编辑时,刷新或关闭页面前弹确认,防止误丢
+  useEffect(() => {
+    const guard = (e: BeforeUnloadEvent) => {
+      if (status === 'working' || dirtyRef.current) {
+        e.preventDefault()
+        e.returnValue = ''
+      }
+    }
+    window.addEventListener('beforeunload', guard)
+    return () => window.removeEventListener('beforeunload', guard)
+  }, [status])
+
   // ---------- 音源 ----------
 
   const loadFile = async (file: File) => {

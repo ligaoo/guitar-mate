@@ -18,9 +18,27 @@ const PAGES: { id: PageId; name: string; icon: string; desc: string }[] = [
   { id: 'pitch', name: '音高轨迹', icon: '📈', desc: '短录音的逐帧音高曲线,音名标注 + 音分偏差' },
 ]
 
+const PAGE_KEY = 'gm-page'
+const validPage = (v: string | null): PageId | null =>
+  PAGES.some((p) => p.id === v) ? (v as PageId) : null
+
 export default function App() {
-  const [page, setPage] = useState<PageId>('chords')
+  const [page, setPage] = useState<PageId>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = validPage(window.localStorage.getItem(PAGE_KEY))
+      if (saved) return saved
+    }
+    return 'chords'
+  })
   const meta = PAGES.find((p) => p.id === page)!
+  const go = (p: PageId) => {
+    setPage(p)
+    try {
+      window.localStorage.setItem(PAGE_KEY, p)
+    } catch {
+      /* ignore */
+    }
+  }
 
   return (
     <div className="app">
@@ -29,7 +47,7 @@ export default function App() {
           🎸 <div>吉他助手<div className="sub">GuitarMate · 本地运行</div></div>
         </div>
         {PAGES.map((p) => (
-          <button key={p.id} className={`nav-item${page === p.id ? ' active' : ''}`} onClick={() => setPage(p.id)}>
+          <button key={p.id} className={`nav-item${page === p.id ? ' active' : ''}`} onClick={() => go(p.id)}>
             <span>{p.icon}</span>
             <span className="nav-text">{p.name}</span>
           </button>
@@ -46,12 +64,13 @@ export default function App() {
       <main className="main">
         <h1 className="page-title">{meta.name}</h1>
         <p className="page-desc">{meta.desc}</p>
-        {page === 'chords' && <ChordsPage />}
-        {page === 'ear' && <EarTrainingPage />}
-        {page === 'tuner' && <TunerPage />}
-        {page === 'transcribe' && <TranscribePage />}
-        {page === 'tone' && <TonePage />}
-        {page === 'pitch' && <PitchTracePage />}
+        {/* 所有页面常驻挂载、仅隐藏切换:切页不销毁进行中的扒谱/录音等状态 */}
+        <div style={{ display: page === 'chords' ? 'block' : 'none' }}><ChordsPage /></div>
+        <div style={{ display: page === 'ear' ? 'block' : 'none' }}><EarTrainingPage active={page === 'ear'} /></div>
+        <div style={{ display: page === 'tuner' ? 'block' : 'none' }}><TunerPage /></div>
+        <div style={{ display: page === 'transcribe' ? 'block' : 'none' }}><TranscribePage /></div>
+        <div style={{ display: page === 'tone' ? 'block' : 'none' }}><TonePage /></div>
+        <div style={{ display: page === 'pitch' ? 'block' : 'none' }}><PitchTracePage /></div>
       </main>
     </div>
   )
