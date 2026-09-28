@@ -410,6 +410,7 @@ export async function transcribeWithBasicPitch(
           onStage,
         )
       } catch (e2) {
+        ;(globalThis as unknown as Record<string, unknown>).__wasmErr = String(e2) + ' | ' + String((e2 as Error)?.stack ?? '').slice(0, 300)
         dbg.__bpMode = 'worker-cpu'
         onStage('model')
         onProgress(0)
