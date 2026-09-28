@@ -9,7 +9,7 @@ import TabView from '../components/TabView'
 import { GuitarSynth } from '../audio/synth'
 import { getCtx, getMaster } from '../audio/engine'
 import { TUNINGS, STANDARD_TUNING } from '../theory/tunings'
-import { loadSongs, saveSong, deleteSong, type SavedSong } from '../stores/songs'
+import { loadSongs, saveSong, deleteSong, exportLibrary, importLibrary, type SavedSong } from '../stores/songs'
 
 // 每拍 12 细分:直 16 分=3 格、三连 8 分=4 格、三连 16 分=2 格 —— 同一整数网格支持直音与三连音
 const SUBDIV = 12
@@ -775,10 +775,10 @@ export default function TranscribePage() {
         </div>
       )}
 
-      {songs.length > 0 && (
-        <div className="card">
-          <h3>📚 曲库({songs.length})</h3>
-          <div className="chip-row">
+      <div className="card">
+        <h3>📚 曲库({songs.length})</h3>
+        {songs.length > 0 && (
+          <div className="chip-row" style={{ marginBottom: 10 }}>
             {songs.map((s) => (
               <span key={s.id} className={`chip${loadedSongName === s.name ? ' active' : ''}`} style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
                 <span style={{ cursor: 'pointer' }} onClick={() => loadSong(s)}
@@ -789,8 +789,29 @@ export default function TranscribePage() {
               </span>
             ))}
           </div>
+        )}
+        <div className="row">
+          <span className="muted small">曲库存在当前浏览器本地,换浏览器/设备需导出导入。</span>
+          <div className="spacer" />
+          <button className="btn sm" onClick={() => {
+            downloadBlob(exportLibrary(), 'guitarmate-曲库.json', 'application/json')
+          }} disabled={songs.length === 0}>⬇ 导出曲库</button>
+          <label className="btn sm" style={{ cursor: 'pointer' }}>
+            📂 导入曲库
+            <input type="file" accept=".json" style={{ display: 'none' }} onChange={async (e) => {
+              const f = e.target.files?.[0]
+              if (!f) return
+              try {
+                const text = await f.text()
+                setSongs(importLibrary(text))
+              } catch (err) {
+                setErrMsg('导入失败:' + String(err))
+              }
+              e.target.value = ''
+            }} />
+          </label>
         </div>
-      )}
+      </div>
 
       {status === 'done' && (
         <>

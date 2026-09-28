@@ -56,3 +56,23 @@ export function renameSong(id: string, name: string): SavedSong[] {
   saveAll(loadSongs().map((s) => (s.id === id ? { ...s, name, updatedAt: Date.now() } : s)))
   return loadSongs()
 }
+
+/** 导出全部曲库为 JSON(跨浏览器/设备转移) */
+export function exportLibrary(): string {
+  return JSON.stringify({ version: 1, songs: loadSongs() }, null, 0)
+}
+
+/** 导入曲库 JSON(合并,同名覆盖) */
+export function importLibrary(json: string): SavedSong[] {
+  const data = JSON.parse(json) as { songs?: SavedSong[] }
+  if (!Array.isArray(data.songs)) throw new Error('文件格式不正确(缺少 songs 字段)')
+  const existing = loadSongs()
+  for (const s of data.songs) {
+    if (!s.name || !Array.isArray(s.notes)) continue // 跳过无效条目
+    const idx = existing.findIndex((e) => e.name === s.name)
+    if (idx >= 0) existing.splice(idx, 1)
+    existing.push(s)
+  }
+  saveAll(existing.slice(0, 30))
+  return loadSongs()
+}
