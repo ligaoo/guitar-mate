@@ -238,6 +238,14 @@ label.field { display: inline-flex; flex-direction: column; gap: 4px; font-size:
 .feedback.ok { color: var(--ok); }
 .feedback.no { color: var(--err); }
 
+/* 复盘与提示 */
+.review-box { margin-top: 16px; padding: 14px 16px; background: var(--panel2); border: 1px solid var(--border); border-radius: 12px; }
+.review-hint { margin-top: 8px; color: var(--accent2); font-size: 13.5px; }
+.hint-panel { max-width: 640px; margin: 0 auto 16px; text-align: left; background: var(--panel2); border: 1px solid rgba(240,180,92,0.3); border-radius: 12px; padding: 10px 14px; }
+.hint-row { display: flex; gap: 10px; padding: 4px 0; border-bottom: 1px dashed var(--border); align-items: baseline; }
+.hint-row:last-child { border-bottom: none; }
+.hint-name { font-weight: 700; min-width: 76px; flex-shrink: 0; font-size: 13.5px; }
+
 .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
 .stat-box { background: var(--panel2); border-radius: 12px; padding: 12px 14px; }
 .stat-box .v { font-size: 22px; font-weight: 800; }

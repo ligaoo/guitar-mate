@@ -1,7 +1,38 @@
-// 练耳页:五种题型,自适应难度,统计面板
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { EAR_KINDS, makeQuestion, type EarKind, type Question } from '../ear/engine'
+// 练耳页:五种题型,自适应难度,统计面板。
+// 交互流:出题静音 → 用户点播放作答 → 答后进入复盘(再听/慢速/对比你的答案/特征提示)→ 手动下一题
+import { useEffect, useMemo, useState } from 'react'
+import {
+  EAR_KINDS,
+  makeQuestion,
+  INTERVAL_HINTS,
+  CHORD_HINTS,
+  SCALE_HINTS,
+  METHOD_HINTS,
+  type EarKind,
+  type Question,
+} from '../ear/engine'
+import { INTERVALS, SCALES } from '../theory/notes'
+import { CHORD_TYPES as CHORD_TYPES_FULL } from '../theory/chords'
 import { loadStats, recordAnswer, resetStats, streakDays, type EarStats } from '../stores/stats'
+import { GuitarSynth } from '../audio/synth'
+import { getCtx } from '../audio/engine'
+
+/** 选项名 → 听感特征(用于「选项特征」面板) */
+function hintOfChoice(kind: EarKind, choice: string): string {
+  if (kind === 'interval') {
+    const hit = INTERVALS.find((i) => i.name === choice)
+    return hit ? INTERVAL_HINTS[hit.short] ?? '' : ''
+  }
+  if (kind === 'chord') {
+    const hit = CHORD_TYPES_FULL.find((t) => t.name === choice)
+    return hit ? CHORD_HINTS[hit.id] ?? '' : ''
+  }
+  if (kind === 'scale') {
+    const hit = SCALES.find((s) => s.name === choice)
+    return hit ? SCALE_HINTS[hit.id] ?? '' : ''
+  }
+  return ''
+}
 
 export default function EarTrainingPage() {
   const [kind, setKind] = useState<EarKind>('interval')
@@ -12,36 +43,28 @@ export default function EarTrainingPage() {
   const [chosen, setChosen] = useState<number[]>([])
   const [seqInput, setSeqInput] = useState<number[]>([])
   const [patternInput, setPatternInput] = useState<boolean[]>([])
-  const timerRef = useRef<number>(0)
+  const [showHints, setShowHints] = useState(false) // 选项特征面板
 
   const level = stats.kinds[kind]?.level ?? 1
 
   const nextQuestion = (k: EarKind = kind, lvl = level) => {
+    // 只出题,不自动播放(静音进入,等用户点播放)
     setQ(makeQuestion(k, Math.max(1, Math.min(5, lvl))))
     setAnswered(false)
     setChosen([])
     setSeqInput([])
     setPatternInput(new Array(16).fill(false))
-    window.setTimeout(() => setQ((cur) => {
-      cur?.replay()
-      return cur
-    }), 60)
   }
 
   useEffect(() => {
     nextQuestion(kind, stats.kinds[kind]?.level ?? 1)
-    return () => window.clearTimeout(timerRef.current)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind])
-
-  // 卸载时清理自动下一题的定时器
-  useEffect(() => () => window.clearTimeout(timerRef.current), [])
 
   const finish = (ok: boolean) => {
     setAnswered(true)
     setWasRight(ok)
     setStats(recordAnswer(kind, ok))
-    timerRef.current = window.setTimeout(() => nextQuestion(), ok ? 1100 : 2000)
   }
 
   const choose = (i: number) => {
@@ -62,17 +85,38 @@ export default function EarTrainingPage() {
     finish(input.every((v, i) => v === target[i]))
   }
 
-  // 键盘 1-9 快捷选择(输入控件聚焦时不触发)
+  // 复盘:播放「你的答案」
+  const playUserMelody = () => {
+    if (!q) return
+    const degrees = [60, 62, 64, 65, 67, 69, 71, 72]
+    const t0 = getCtx().currentTime + 0.05
+    seqInput.forEach((d, i) => GuitarSynth.pluckMidi(degrees[d - 1] ?? 60, { when: t0 + i * 0.5, gain: 0.42 }))
+  }
+
+  const playUserRhythm = () => {
+    if (!q?.slots) return
+    const t0 = getCtx().currentTime + 0.08
+    const d = 0.28
+    patternInput.slice(0, q.slots).forEach((hit, i) => {
+      if (hit) GuitarSynth.click(t0 + i * d, i === 0, 0.55)
+    })
+  }
+
+  // 键盘:数字作答 / Backspace 删除 / Enter 下一题 / 空格重播
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!q) return
       const target = e.target as HTMLElement | null
       if (target && ['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) return
+      if (answered && e.key === 'Enter') {
+        nextQuestion()
+        return
+      }
       const n = parseInt(e.key, 10)
       if (!isNaN(n) && n >= 1) {
-        if (q.kind === 'melody' && n <= 8) {
-          if (!answered && seqInput.length < (q.answerSeq?.length ?? 8)) setSeqInput((s) => [...s, n])
-        } else if (q.choices.length > 0 && n <= q.choices.length && q.answer >= 0) {
+        if (q.kind === 'melody' && !answered && n <= 8) {
+          if (seqInput.length < (q.answerSeq?.length ?? 8)) setSeqInput((s) => [...s, n])
+        } else if (!answered && q.choices.length > 0 && n <= q.choices.length && q.answer >= 0) {
           choose(n - 1)
         }
       }
@@ -96,6 +140,7 @@ export default function EarTrainingPage() {
   const today = stats.daily[todayKey]
   const streak = useMemo(() => streakDays(stats), [stats])
   const recentHistory = (kindStat?.history ?? []).slice(-30)
+  const hasChoiceHints = kind === 'interval' || kind === 'chord' || kind === 'scale'
 
   return (
     <>
@@ -114,11 +159,31 @@ export default function EarTrainingPage() {
       <div className="card question-box">
         {q && (
           <>
-            <div className="prompt">{q.prompt}</div>
+            <div className="prompt">{q.prompt}{!answered && <span className="muted small">(点下方播放开始)</span>}</div>
             <div className="row" style={{ justifyContent: 'center', marginBottom: 18 }}>
               <button className="btn primary big" onClick={() => q.replay()}>▶ 播放</button>
               {q.replaySlow && <button className="btn big" onClick={() => q.replaySlow!()}>🐢 慢速</button>}
+              {hasChoiceHints && (
+                <button className={`chip${showHints ? ' warn-active' : ''}`} onClick={() => setShowHints(!showHints)}>
+                  💡 选项特征{showHints ? '(开)' : ''}
+                </button>
+              )}
             </div>
+
+            {/* 选项听感特征面板(答题前后都可用,不泄露答案) */}
+            {showHints && hasChoiceHints && (
+              <div className="hint-panel">
+                {q.choices.map((c) => (
+                  <div key={c} className="hint-row">
+                    <span className="hint-name">{c}</span>
+                    <span className="muted small">{hintOfChoice(kind, c) || '—'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {!hasChoiceHints && (
+              <div className="muted small" style={{ marginBottom: 10 }}>💡 {METHOD_HINTS[kind]}</div>
+            )}
 
             {/* 音程/和弦/音阶:选择题 */}
             {q.choices.length > 0 && q.answer >= 0 && (
@@ -169,9 +234,7 @@ export default function EarTrainingPage() {
                       ✓ 提交答案
                     </button>
                   </div>
-                ) : (
-                  <div className="feedback">{q.detail}</div>
-                )}
+                ) : null}
               </>
             )}
 
@@ -199,14 +262,32 @@ export default function EarTrainingPage() {
                     <button className="btn primary" onClick={submitPattern}>✓ 提交答案</button>
                     <button className="btn ghost" onClick={() => setPatternInput(new Array(q.slots).fill(false))}>清空</button>
                   </div>
-                ) : (
-                  <div className="feedback">{q.detail}</div>
-                )}
+                ) : null}
               </>
             )}
 
-            {answered && q.answer >= 0 && <div className={`feedback ${wasRight ? 'ok' : 'no'}`}>{wasRight ? '✓ 正确!' : '✗ 再听一遍'} {q.detail}</div>}
-            <div className="muted small mt">快捷键:空格重播 · 数字键作答 · Backspace 删除</div>
+            {/* 复盘环节:答完不自动跳题 */}
+            {answered && (
+              <div className="review-box">
+                <div className={`feedback ${wasRight ? 'ok' : 'no'}`}>{wasRight ? '✓ 正确!' : '✗ 没关系,听听区别'} {q.detail}</div>
+                {q.hint && <div className="review-hint">💡 听感特征:{q.hint}</div>}
+                <div className="row" style={{ justifyContent: 'center', marginTop: 10 }}>
+                  <button className="btn" onClick={() => q.replay()}>🔊 再听题目</button>
+                  {q.replaySlow && <button className="btn" onClick={() => q.replaySlow!()}>🐢 慢速</button>}
+                  {q.kind === 'melody' && seqInput.length > 0 && (
+                    <button className="btn" onClick={playUserMelody}>🔊 你的答案</button>
+                  )}
+                  {q.kind === 'rhythm' && patternInput.some(Boolean) && (
+                    <button className="btn" onClick={playUserRhythm}>🔊 你的答案</button>
+                  )}
+                  <button className="btn primary" onClick={() => nextQuestion()}>下一题 →</button>
+                </div>
+                <div className="muted small" style={{ marginTop: 8 }}>复盘完再走:反复听、对比你的答案,是练耳进步最快的方式(Enter = 下一题)</div>
+              </div>
+            )}
+            {!answered && (
+              <div className="muted small mt">快捷键:空格重播 · 数字键作答 · Backspace 删除</div>
+            )}
           </>
         )}
       </div>

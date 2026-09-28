@@ -23,9 +23,61 @@ export interface Question {
   answerSeq?: number[] // 旋律:音级序列
   slots?: number // 节奏:总格数
   answerPattern?: boolean[] // 节奏:每格是否有音
-  detail: string
+  detail: string // 答案说明
+  hint?: string // 正确答案的听感特征(复盘展示)
   replay: () => void
   replaySlow?: () => void
+}
+
+// ---- 听感特征提示(教学提示:该听什么) ----
+
+export const INTERVAL_HINTS: Record<string, string> = {
+  m2: '半音摩擦,紧贴不安——导音"贴"着主音的感觉',
+  M2: '音阶相邻两级,平顺自然,没有紧张感',
+  m3: '带小调色彩,下行时尤其忧郁',
+  M3: '明亮开阔的大调色彩,像阳光;《两只老虎》里 2→3 就是它',
+  P4: '号角般坚定稳定;《婚礼进行曲》"新娘来了"的开头上行',
+  TT: '不安、诡异、悬在半空("魔鬼音程"),总想逃去别的音',
+  P5: '空旷坚定,殿堂感;《小星星》1→5 的跳进',
+  m6: '比五度更辽阔,但染着一层忧郁',
+  M6: '宽广激昂,像推开一扇大窗',
+  m7: '明显的未完成感,渴望解决到八度',
+  M7: '几乎贴着八度却差半音,尖锐紧张',
+  P8: '同一个音的高低两个身份,豁然开朗;《Over the Rainbow》"Some-where"',
+}
+
+export const CHORD_HINTS: Record<string, string> = {
+  maj: '明亮、稳定、愉快——"正常"的大和弦',
+  min: '柔和、内敛、忧伤,像大和弦蒙了层灰',
+  '7': '不安分、想往前解决,带布鲁斯味',
+  maj7: '梦幻悬浮的爵士感,像一杯雾',
+  m7: '柔和中带点慵懒,常见于抒情/Neo-Soul',
+  dim: '紧张收缩,恐怖片/悬疑配乐的常客',
+  aug: '迷离、扩张、晕开的感觉',
+  sus2: '空灵、未决,像少了点什么',
+  sus4: '悬在半空想落回大三,教堂/民谣感',
+  add9: '明亮开阔又带一层色彩,流行抒情常用',
+  '6': '温暖复古,老式流行/爵士的甜味',
+  m7b5: '暗淡紧张,爵士小调的阴天',
+}
+
+export const SCALE_HINTS: Record<string, string> = {
+  major: '明亮完整,do-re-mi 的家乡',
+  minor: '忧郁的传统小调,古典小曲的底色',
+  harmonicMinor: '小调里藏一个"诡异"的大跨步(第6→7音)',
+  majorPent: '去掉半音关系的五声,中国风/民谣感',
+  minorPent: '摇滚与布鲁斯的万能音阶,干脆利落',
+  blues: '五声里加了一个"哭腔"滑音感',
+  dorian: '小调但第6音被提亮,忧郁中带一点向上',
+  mixolydian: '大调但第7音被压低,摇滚/民谣的豪爽',
+}
+
+export const METHOD_HINTS: Record<EarKind, string> = {
+  interval: '先判断两音是"贴着"(小音程)还是"跳远"(大音程),再哼出来对照',
+  chord: '先问自己明不明显"开心"(大)还是"难过"(小),再听有没有第4个音带来的额外色彩',
+  scale: '跟着哼:明 or 暗?有没有东方五声感?有没有突然的大跳或怪音?',
+  melody: '先记住第一个音,跟着哼;数清一共几个音,注意相邻是级进还是跳进',
+  rhythm: '先跟着打稳定拍,再注意哪些拍上有音、有没有落在半拍',
 }
 
 const rand = (n: number) => Math.floor(Math.random() * n)
@@ -76,6 +128,7 @@ function makeInterval(level: number): Question {
     choices,
     answer: choices.indexOf(target.name),
     detail: `${midiToName(low)} → ${midiToName(high)} 是 ${target.name}(${target.short})`,
+    hint: INTERVAL_HINTS[target.short],
     replay: play(false),
     replaySlow: play(true),
   }
@@ -107,6 +160,7 @@ function makeChord(level: number): Question {
     choices,
     answer: choices.indexOf(target.name),
     detail: `这是 ${midiToName(root)}${target.suffix}(${target.name})`,
+    hint: CHORD_HINTS[target.id],
     replay: play(false),
     replaySlow: play(true),
   }
@@ -141,6 +195,7 @@ function makeScale(level: number): Question {
     choices,
     answer: choices.indexOf(target.name),
     detail: `这是从 ${midiToName(root)} 开始的${target.name}`,
+    hint: SCALE_HINTS[target.id],
     replay: play(false),
     replaySlow: play(true),
   }
@@ -176,6 +231,7 @@ function makeMelody(level: number): Question {
     answer: -1,
     answerSeq: seq.map((d) => d + 1),
     detail: `正确答案:${seq.map((d) => d + 1).join(' ')}`,
+    hint: METHOD_HINTS.melody,
     replay: play(false),
     replaySlow: play(true),
   }
@@ -223,6 +279,7 @@ function makeRhythm(level: number): Question {
     slots,
     answerPattern: pattern,
     detail: `正确节奏:${pattern.map((h) => (h ? '●' : '○')).join(' ')}`,
+    hint: METHOD_HINTS.rhythm,
     replay: play(false),
     replaySlow: play(true),
   }
