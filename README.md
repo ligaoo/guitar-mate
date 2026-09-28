@@ -32,13 +32,21 @@ npm test         # 算法自测(39 项:和弦/指法/导出/扒谱/音色/音高
 
 ## 如何分享给别人
 
-构建产物 `dist/` 是**纯静态文件**(含 AI 模型),三种方式:
+构建产物 `dist/` 是**纯静态文件**(含 AI 模型),四种方式:
 
-1. **免费托管(推荐)**:打开 [Netlify Drop](https://app.netlify.com/drop) 把 `dist` 文件夹拖进去,几秒后得到一个 `https://xxx.netlify.app` 链接,发给别人即可。Cloudflare Pages / Vercel 同理。https 环境下全部功能可用(含麦克风),别人还能在浏览器里把应用"安装"到桌面(PWA)。
-2. **局域网共享(临时)**:本机运行 `npm run host`,把打印的 `http://192.168.x.x:4173` 发给同一 WiFi 下的人。注意:非 localhost 的 http 下浏览器禁止麦克风,调音器/录音不可用,其他功能(和弦/练耳/文件导入扒谱/文件导入音高轨迹)正常。
-3. **自己的服务器/NAS**:`npm run build` 后把 `dist/` 上传到任意静态目录(nginx/caddy/OSS)。**支持部署在子路径**(资源全部相对引用,已验证);配好 https 后麦克风可用(Caddy 可自动签发)。
-
-不需要 Node 的只有方式 1 和 3 的访客侧;方式 2 需要你这台机器保持开机运行。
+0. **GitHub Pages(推荐)**:仓库已带自动部署工作流(`.github/workflows/deploy.yml`),发布步骤:
+   1. 在 github.com 新建空仓库 `guitar-mate`(Public,不勾选 README)
+   2. 本目录执行:
+      ```bash
+      git remote add origin https://github.com/<你的用户名>/guitar-mate.git
+      git push -u origin main
+      ```
+   3. 仓库 **Settings → Pages → Build and deployment → Source 选 "GitHub Actions"**(只需一次)
+   4. 等 Actions 跑完(约 2 分钟),访问 `https://<你的用户名>.github.io/guitar-mate/`
+   之后每次 `git push` 自动重新部署。https 环境全功能可用(含麦克风),可安装为 PWA。
+1. **免费托管**:打开 [Netlify Drop](https://app.netlify.com/drop) 把 `dist` 文件夹拖进去,几秒后得到一个 `https://xxx.netlify.app` 链接。Cloudflare Pages / Vercel 同理。
+2. **局域网共享(临时)**:本机运行 `npm run host`,把打印的 `http://192.168.x.x:4173` 发给同一 WiFi 下的人。注意:非 localhost 的 http 下浏览器禁止麦克风,调音器/录音不可用,其他功能正常。
+3. **自己的服务器/NAS**:`npm run build` 后把 `dist/` 上传到任意静态目录(nginx/caddy/OSS)。**支持部署在子路径**(资源全部相对引用,已验证);配好 https 后麦克风可用。
 
 ## PWA
 
