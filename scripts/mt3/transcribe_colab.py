@@ -221,6 +221,9 @@ class InferenceModel(object):
 
 
 # ---- 批量转写 ----
+# WAV_DIR 里的每个 wav 都会被转写:GuitarSet 片段(--export-wav 导出)与整曲
+# (如 godknows.wav)放同一目录即可。整曲由 MT3 内部滑窗切分(约 5.12s/窗),
+# 密集混音单窗 token 预算 1024,极端密集段落可能被截断——这是模型行为,如实测量。
 import soundfile as sf
 
 model = InferenceModel(CHECKPOINT, model_type='mt3')
@@ -232,10 +235,16 @@ for wav_path in sorted(glob.glob(os.path.join(WAV_DIR, '*.wav'))):
     if sr != SAMPLE_RATE:
         audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
     est_ns = model(audio)
+    # program/is_drum 一并导出:本地评分端按「吉他音色 GM 24-30」过滤后再对比
+    # (MT3 是全乐器模型,整曲混音会把贝斯/人声旋律也写出来,不过滤则精确率天然偏低)
     notes = [{'start': n.start_time, 'end': n.end_time, 'midi': int(n.pitch),
+              'program': int(n.program), 'is_drum': bool(n.is_drum),
               'confidence': min(1.0, n.velocity / 127)}
              for n in est_ns.notes]
     with open(os.path.join(OUT_DIR, clip_id + '.raw.json'), 'w') as f:
         json.dump({'notes': notes, 'model': 'mt3'}, f)
     print(clip_id, len(notes), 'notes')
-print('完成,下载', OUT_DIR, '目录回本地,评分: npm run eval -- --engine=ext --ext-dir=<目录> --variant=raw')
+print('完成,下载', OUT_DIR, '目录回本地:')
+print('  · GuitarSet 片段评分: npm run eval -- --engine=ext --ext-dir=<目录> --variant=raw')
+print('  · 整曲 vs 人工参考谱(5指标+基线+分数级): npx esbuild scripts/ext-song-score.ts --bundle --format=cjs --platform=node --outfile=.es.cjs')
+print('    node .es.cjs --json=<目录>/godknows.raw.json --ref-dir=D:/music/godknows-ref')

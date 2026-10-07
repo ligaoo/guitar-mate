@@ -236,6 +236,7 @@ FPS = Math.floor(22050 / 256) = 86          // 现用值
 | **2 sweep 扩界** | OTS 加 0.60、FTS 加 0.5/0.6（越过 0.40 边界）+ **holdout 留出集**（哈希分池，寻优只在 sweep 池） | 后台运行中 → `eval/param-sweep-v2.json`（结果落地后回填） |
 | **4 数据工厂** | `scripts/ref-pipeline.ts` 一键流水线（解析→推理缓存→对齐+音高消歧→逐音验证→曲库+报告+**训练三元组** `.triple.json` + 一致性摘要 `dataset.json`）；核心逻辑抽到 `scripts/ref-core.ts`（与分步脚本共用）；`parse-songsterr.ts` 入库 | 端到端验证：复现 offset 0.610 / 主音 91.4% / 节奏 81.9%，三元组逐音带 conf/verdict ✅ |
 | **5 产品层** | 失真检测自动分层（`distortionIndex`，导入即测）；「🔥 失真优先」预设 + 自动选档；能力分层诚实提示（高失真=草稿 ~21%，干净独奏 ~83%，附口径）；曲库「📖 参考谱」来源徽标（`source:'ref'`）；页面过时的「55%」等口径修正 | UI 落地 ✅（真人计时验证待做，见 M5 判据） |
+| **3 模型·第一步** | MT3 接入的整曲版：`transcribe_colab.py` 输出 program/is_drum；`scripts/ext-song-score.ts` 把外部引擎整曲输出按**同口径**（5 指标+基线+分数级，共享 `eval/ref-report.ts`）评分，三行口径（全部/仅吉他音色/吉他+音域）防选择性引用；`scripts/build-corpus.ts` 训练语料构建器（三元组 + GuitarSet → JSONL，实测 **361 条 / 43,653 音 / 3.12h**，弦/品级） | 评分链已用合成完美转写验证（union F1=100.0%，过滤行为正确）✅；**MT3 真实数字待一次 Colab 运行**（M3） |
 
 ### 阶段 2 落地后的核心数字（《God knows》，并集 6911 音，±50ms+音高全等，最大二分匹配）
 
@@ -249,8 +250,9 @@ FPS = Math.floor(22050 / 256) = 86          // 现用值
 
 ### 待办（按序）
 
-1. **sweep v2 落地后**：若 holdout 证实更高 ft（>0.40）更优 → 更新干净档预设；否则记录「边界内最优已确认」。
-2. **阶段 3（需你跑一次）**：`scripts/mt3/transcribe_colab.py` 在 Colab 上跑 MT3 → 拿本曲真实数字（`--engine=ext` 链已备好）。
-3. **阶段 4 扩量**：用 `ref-pipeline` 批量跑 ≥50 首（Songsterr 取谱 + 对应录音；一致性门槛用 `dataset.json` 的 verifiedShare）。
-4. **M5 真人验证**：3 分钟失真混音从导入到可演奏谱的中位耗时 <15 分钟。
-5. CALIB 权重若再动 → 必须重拟合 a/b（权重变分就变）。
+1. **跑一次 Colab（阶段 3 的唯一用户动作）**：按 `scripts/mt3/README.md`——上传 `eval-export/`（含 godknows.wav）逐单元运行 `transcribe_colab.py`，下载 `mt3-out/` 后本地 `node .es.cjs --json=.../godknows.raw.json` 即得 M3 数字；GuitarSet 片段对比同一次跑完。
+2. **sweep v2 落地后**：若 holdout 证实更高 ft（>0.40）更优 → 更新干净档预设；否则记录「边界内最优已确认」。
+3. **阶段 3.2 域适配**：语料已就绪（`eval/corpus-guitar.jsonl`，构建命令在 `scripts/build-corpus.ts`）；方向选择等 M3 数字——MT3 官方不支持训练，微调走 T5X 自建管线或 Basic Pitch 微调，二者都以此语料为输入。
+4. **阶段 4 扩量**：用 `ref-pipeline` 批量跑 ≥50 首（Songsterr 取谱 + 对应录音；一致性门槛用 `dataset.json` 的 verifiedShare）。
+5. **M5 真人验证**：3 分钟失真混音从导入到可演奏谱的中位耗时 <15 分钟。
+6. CALIB 权重若再动 → 必须重拟合 a/b（权重变分就变）。

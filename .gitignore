@@ -6,3 +6,4 @@ public/vendor/
 *.log
 .eval/
 eval/real-clips*.json
+eval/corpus-*.jsonl
