@@ -48,6 +48,9 @@ export interface AutoOptions {
   maxFret?: number
   /** 是否先做分轨预处理(实测默认不该开,见 ACCURACY.md) */
   separate?: boolean
+  /** 原混音上测得的失真指数。输入若是分轨产物必须传:分轨会改写削波/压缩指纹,
+   *  在分轨后的信号上测会把失真曲误判成干净(实测《God knows》0.98 → 0.00) */
+  distortion?: number
   onStage?: (s: AutoStage) => void
 }
 
@@ -94,7 +97,10 @@ export interface AutoResult {
     /** 素材失真指数(≥ DISTORTION_ROUTE 时自评/标定预测都只代表内部一致性,不代表真实准确率) */
     distortion: number
     notes: number
-    retunedSegments: number
+    /** 节奏落格差(疑似 BPM/第一拍不准)的段数:只标记、不自动重估(组装用全曲统一网格) */
+    gridSuspectSegments: number
+    /** 每段最多尝试次数(召回模式为 1:闭环动作改不动交付结果) */
+    attemptsPerSegment: number
     totalAttempts: number
   }
 }
@@ -163,6 +169,7 @@ export async function autoTranscribe(
   const maxFret = opts.maxFret ?? 15
   const stage = opts.onStage ?? (() => {})
   const duration = pcm22.length / SR
+  const distortion = opts.distortion ?? distortionIndex(pcm22)
 
   // ---- 一次推理 ----
   stage({ phase: 'infer', done: 0, total: 1 })
@@ -227,10 +234,14 @@ export async function autoTranscribe(
     polyphonic: polyphonyMax >= 2,
     confMedian,
     density,
-    distortion: distortionIndex(pcm22),
+    distortion,
   })
   const globalKey = detectKey(probe.notes)
   const anchor = probe.offset
+  // 召回模式(失真档)下闭环改不动交付结果:聚合提取器不读 onset/frame 阈值与 melodia,
+  // 而 minConf/复音上限/调性过滤只作用于段内自评(组装时按 minConf 0 重新量化,与标定口径一致)。
+  // 旧实现每段照样试 3 次——《God knows》22 段 × 3 = 66 次尝试,交付音符与每段只试 1 次逐位相同。
+  const attemptsPerSegment = globalParams.recallExtract ? 1 : maxAttempts
 
   // ---- 逐段自评循环 ----
   const plans = planSegments(duration, probe.bpm, opts.barsPerSegment ?? 8)
@@ -238,7 +249,7 @@ export async function autoTranscribe(
   const reports: SegmentReport[] = []
   const tStart = Date.now()
   let totalAttempts = 0
-  let retuned = 0
+  let gridSuspect = 0
 
   for (const plan of plans) {
     const sl = sliceFrames(frames, onsetFrames, allOnsets, plan.t0, plan.t1)
@@ -246,10 +257,8 @@ export async function autoTranscribe(
     let params = { ...globalParams }
     let best: SegmentReport['best'] | null = null
     let exhausted = false
-    let bpmTried = false
 
-    for (let k = 0; k < maxAttempts; k++) {
-      const bpmUse = bpmTried ? probe.bpm : probe.bpm
+    for (let k = 0; k < attemptsPerSegment; k++) {
       const r = await postProcessFrames(
         sl.frames,
         sl.onsets,
@@ -292,21 +301,18 @@ export async function autoTranscribe(
         best = { params: { ...params }, notes, assessment: assess }
       }
       if (assess.verdict === 'pass') break
-      if (k === maxAttempts - 1) break
+      if (k === attemptsPerSegment - 1) break
       // 时间预算:超了就停止重试,把这一段标为"未充分重试"
       if (Date.now() - tStart > budgetMs) {
         exhausted = true
         break
       }
-      const acts: QualityAction[] = assess.actions
-      if (acts.includes('retry-bpm')) {
-        // BPM 重估:在 ±3% 内按格内贴合重新挑一次(段内证据比全局更贴近这段)
-        bpmTried = true
-        retuned++
-      }
-      params = applyActions(params, acts)
+      params = applyActions(params, assess.actions)
     }
     if (best) {
+      // 落格差的段只做标记、不自动重估:组装用全曲统一的 BPM 与锚点量化(网格必须全曲连续),
+      // 段内单独改 BPM 改不到交付的谱面
+      if (best.assessment.actions.includes('retry-bpm')) gridSuspect++
       reports.push({ index: plan.index, t0: plan.t0, t1: plan.t1, attempts, best, exhausted })
     }
     stage({ phase: 'segments', done: plan.index + 1, total: plans.length, detail: `段 ${plan.index + 1}/${plans.length}` })
@@ -348,7 +354,6 @@ export async function autoTranscribe(
   // 标定外推门控:回归式是在**干净 GuitarSet** 上拟合的,对高失真混音外推会严重虚高
   // (实测:失真整曲自评 0.69/预计 61%,对人工参考的真实一致度仅 2%)。
   // 失真素材拒报"预计准确率",只给档位区间 + 警示。
-  const distortion = distortionIndex(pcm22)
   const trustCalibration = distortion < DISTORTION_ROUTE
   stage({ phase: 'done', done: 1, total: 1 })
 
@@ -372,7 +377,8 @@ export async function autoTranscribe(
       /** 素材失真指数(≥DISTORTION_ROUTE 时自评与标定预测都只代表内部一致性,不代表真实准确率) */
       distortion,
       notes: tab.length,
-      retunedSegments: retuned,
+      gridSuspectSegments: gridSuspect,
+      attemptsPerSegment,
       totalAttempts,
     },
   }

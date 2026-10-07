@@ -25,6 +25,8 @@ const tests = [
   'test-quantize.ts',
   'test-library.ts',
   'test-auto.ts',
+  'test-import-e2e.ts',
+  'test-ref-align.ts',
   'test-eval-smoke.ts',
   'test-real-eval.ts',
 ]

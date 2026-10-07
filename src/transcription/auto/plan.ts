@@ -101,22 +101,24 @@ export const DISTORTION_ROUTE = 0.5
  */
 export function baseParams(ctx: AutoContext): AutoParams {
   const sixteenth = 60 / Math.max(30, ctx.bpm) / 4
-  const minNoteLenFrames = clamp(Math.round(sixteenth * 86 * 0.6), 4, 12)
+  // 最短音长倍率随素材:独奏 ×0.6;复音(和弦伴奏)×0.3 —— 快和弦敲击需要更短的下限
+  // (v2 寻优 + holdout 确认:comp ×0.3 比 ×0.6 高 2.1pt;×0.6 仍是 solo 最优)
+  const mnlMult = ctx.polyphonic ? 0.3 : 0.6
+  const minNoteLenFrames = clamp(Math.round(sixteenth * 86 * mnlMult), 3, 12)
   // 失真/混音路由(音色自适应)——**召回优先**(PLAN-90 阶段2,2026-10-07 按实测翻转方向):
   // 失真混音的瓶颈是召回(模型墙),保守阈值只会把少数真音连同幻觉一起删掉。
   // 实测(时基修复后,《God knows》并集口径):保守 ot0.55/ft0.40 = 5.9% →
   // ot0.35/ft0.30 = 14.8% → 召回聚合提取(阶段 2 实装,recallExtract)= 20.6%/4072 音。
   // 闭环仍可按段收紧;产物定位"草稿中的草稿"(报告带失真警示,见 conductor 外推门控)。
   const distorted = ctx.distortion >= DISTORTION_ROUTE
-  // 干净档(2026-10-07 真实数据寻优,60 片段/6 演奏者,eval/param-sweep.json):
-  //   solo 81.0→83.3(ot0.55/ft0.40)· comp 57.4→63.0(ot0.50/ft0.40);
-  //   两档 ft 最优都在 0.40(与 God knows 闭环收敛点一致);melodia 真实数据全面无益
-  //   (solo −1.4 / comp −0.6 / 整曲闭环也收敛到关)→ 默认关闭,闭环仍可尝试打开。
-  // 失真档:召回聚合提取(2026-10-07 阶段 2 实装):同一帧矩阵上单帧双阈值只到
-  //   15.4%,聚合提取(帧分段+onset联合+持续门限)到 20.6%/4072 音(oracle 26%)。
+  // 干净档(2026-10-07 v2 扩界寻优 + holdout,60 片段,eval/param-sweep-v2.json):
+  //   ft 0.40 → **0.60**:两档最大单项收益,holdout 确认(solo 85.0→85.7 / comp 65.8→71.1);
+  //   真实吉他帧激活远高于幻觉,抬帧阈值主要删伪音。0.60 仍在网格边界(0.3→0.6 单调升)。
+  //   ot:复音 0.50 最优;独奏平台区(0.5/0.55/0.6 差 <0.3pt)取 0.55。
+  //   melodia 第 3 次确认无益,保持关。
   return {
-    onsetThresh: distorted ? 0.35 : 0.55,
-    frameThresh: distorted ? 0.3 : 0.4,
+    onsetThresh: distorted ? 0.35 : ctx.polyphonic ? 0.5 : 0.55,
+    frameThresh: distorted ? 0.3 : 0.6,
     minNoteLenFrames,
     melodiaTrick: false,
     recallExtract: distorted,

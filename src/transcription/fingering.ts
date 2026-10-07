@@ -113,6 +113,28 @@ function solveCluster(cands: Pos[][], prev: Pos | null): Pos[] | null {
   return best
 }
 
+/** 簇内无完整解时(音高被限死在同一根弦上等):找能同时按出的**最大子集**(音数最多,
+ *  同数时置信度和最大),其余才进丢弃报告。簇 ≤8 音 → 子集 ≤255 个,每个用 solveCluster 判可行。
+ *  旧实现按"候选越多越先安排"贪心,约束最紧的音反而最后排,于是被挤掉的音比必要的多。 */
+function solveClusterPartial(cl: Note[], cands: Pos[][], prev: Pos | null): (Pos | null)[] {
+  const n = cl.length
+  const conf = (i: number) => cl[i].conf ?? 0.5
+  let best: { picks: (Pos | null)[]; count: number; confSum: number } | null = null
+  for (let mask = (1 << n) - 1; mask > 0; mask--) {
+    const sel: number[] = []
+    for (let i = 0; i < n; i++) if (mask & (1 << i)) sel.push(i)
+    if (best && sel.length < best.count) continue
+    const confSum = sel.reduce((a, i) => a + conf(i), 0)
+    if (best && sel.length === best.count && confSum <= best.confSum) continue
+    const sol = solveCluster(sel.map((i) => cands[i]), prev)
+    if (!sol) continue
+    const picks: (Pos | null)[] = new Array<Pos | null>(n).fill(null)
+    sel.forEach((i, k) => (picks[i] = sol[k]))
+    best = { picks, count: sel.length, confSum }
+  }
+  return best ? best.picks : new Array<Pos | null>(n).fill(null)
+}
+
 export function assignFingering(notes: Note[], tuning: number[], maxFret = 15): FingeringResult {
   if (notes.length === 0) return { notes: [], dropped: [] }
   // 超出指板范围的音直接进丢弃报告
@@ -137,20 +159,18 @@ export function assignFingering(notes: Note[], tuning: number[], maxFret = 15): 
   let prev: Pos | null = null
   for (const cl of clusters) {
     const cands = cl.map((n) => positionsForMidi(n.midi, tuning, maxFret))
-    let picks: Pos[] | null = cl.length <= 8 ? solveCluster(cands, prev) : null
+    let picks: (Pos | null)[] | null = cl.length <= 8 ? solveCluster(cands, prev) : null
+    if (!picks && cl.length <= 8) picks = solveClusterPartial(cl, cands, prev)
     if (!picks) {
-      // 簇内无解(音数超过可用弦数等):按"候选越多越先安排"贪心,安排不下的进丢弃报告
-      const order = cl.map((_, i) => i).sort((a, b) => cands[b].length - cands[a].length)
+      // 超大簇(>8 音,正常链路被复音上限挡在 6 以内):约束最紧(候选最少)的音先安排
+      const order = cl.map((_, i) => i).sort((a, b) => cands[a].length - cands[b].length || (cl[b].conf ?? 0) - (cl[a].conf ?? 0))
       const used = new Set<number>()
-      picks = new Array<Pos>(cl.length)
+      picks = new Array<Pos | null>(cl.length).fill(null)
       for (const i of order) {
         const pick = cands[i]
           .filter((p) => !used.has(p.string))
           .sort((a, b) => positionCost(a) - positionCost(b))[0]
-        if (!pick) {
-          dropped.push({ midi: cl[i].midi, step: cl[i].step, dur: cl[i].dur, reason: 'conflict' })
-          picks[i] = { string: -1, fret: -1 }
-        } else {
+        if (pick) {
           used.add(pick.string)
           picks[i] = pick
         }
@@ -158,8 +178,11 @@ export function assignFingering(notes: Note[], tuning: number[], maxFret = 15): 
     }
     let anchor: Pos | null = null
     for (let i = 0; i < cl.length; i++) {
-      const p: Pos | undefined = picks[i]
-      if (!p || p.string < 0) continue
+      const p: Pos | null = picks[i]
+      if (!p) {
+        dropped.push({ midi: cl[i].midi, step: cl[i].step, dur: cl[i].dur, reason: 'conflict' })
+        continue
+      }
       assigned.push({ note: cl[i], pos: p })
       // 低音锚点(最靠低音弦的音)承接给下一簇
       if (!anchor || p.string < anchor.string) anchor = p
@@ -169,18 +192,42 @@ export function assignFingering(notes: Note[], tuning: number[], maxFret = 15): 
 
   // ---- 跨簇同弦区间重叠修复:同弦且时间重叠 = 物理上按不出来 ----
   const kept: { note: Note; pos: Pos }[] = []
+  const clashOn = (string: number, note: Note) => kept.find((k) => k.pos.string === string && overlaps(k.note, note))
+  // 每个 step 已被簇内分配占用的弦:换弦时不能抢同簇其他音的弦(否则只是把冲突转嫁给它)
+  const stepStrings = new Map<number, Set<number>>()
+  for (const x of assigned) {
+    const s = stepStrings.get(x.note.step) ?? new Set<number>()
+    s.add(x.pos.string)
+    stepStrings.set(x.note.step, s)
+  }
   for (const a of assigned) {
-    const conflict = kept.find((k) => k.pos.string === a.pos.string && overlaps(k.note, a.note))
-    if (!conflict) {
+    if (!clashOn(a.pos.string, a.note)) {
       kept.push(a)
       continue
     }
-    // 换到另一根不冲突的弦
+    // 先换到另一根不冲突、也没被同簇占用的弦(保住前一个音的延音)
+    const taken = stepStrings.get(a.note.step) as Set<number>
     const fixed = positionsForMidi(a.note.midi, tuning, maxFret)
-      .filter((p) => !kept.some((k) => k.pos.string === p.string && overlaps(k.note, a.note)))
+      .filter((p) => !taken.has(p.string) && !clashOn(p.string, a.note))
       .sort((x, y) => positionCost(x) - positionCost(y))[0]
-    if (fixed) kept.push({ note: a.note, pos: fixed })
-    else dropped.push({ midi: a.note.midi, step: a.note.step, dur: a.note.dur, reason: 'conflict' })
+    if (fixed) {
+      taken.delete(a.pos.string)
+      taken.add(fixed.string)
+      kept.push({ note: a.note, pos: fixed })
+      continue
+    }
+    // 无弦可换:同一根弦上更强的新起音会掐断前一个音 —— 截短先前的音,而不是丢掉新音。
+    // 但比前音弱的"新音"多半是前音的泛音/重影(失真整曲实测:不分强弱一律截短,找回的音
+    // 只有约 7% 是对的,并集 F1 反降 0.4;按置信度门控后两版录音都不降),这类仍进丢弃报告。
+    // (同一 step 的音已在簇内分到不同弦,所以冲突的一定是更早起音的音)
+    let clash = clashOn(a.pos.string, a.note)
+    const stronger = clash !== undefined && (a.note.conf ?? 0.5) >= (clash.note.conf ?? 0.5)
+    while (stronger && clash && clash.note.step < a.note.step) {
+      clash.note = { ...clash.note, dur: a.note.step - clash.note.step }
+      clash = clashOn(a.pos.string, a.note)
+    }
+    if (clash) dropped.push({ midi: a.note.midi, step: a.note.step, dur: a.note.dur, reason: 'conflict' })
+    else kept.push(a)
   }
 
   kept.sort((a, b) => a.note.step - b.note.step || a.note.midi - b.note.midi)

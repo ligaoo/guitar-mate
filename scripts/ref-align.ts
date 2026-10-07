@@ -15,8 +15,8 @@ import { readFile } from 'node:fs/promises'
 import { join, isAbsolute } from 'node:path'
 
 import { toMono, resampleLinear, estimateOnsets, SR } from '../src/transcription/pipeline'
-import { bpTimeToFrame } from '../src/transcription/basicPitch'
 import { decodeWav } from './eval/wav'
+import { disambiguateByPitch } from './ref-core'
 
 const root = process.cwd()
 const args = process.argv.slice(2)
@@ -134,7 +134,7 @@ async function main() {
   // ---------- ②b 音高敏感消歧(修"差一拍"bug,2026-10-07)----------
   // 起音列车无法分辨整拍平移(±1 拍的命中率几乎相同),但**音高激活**可以:
   // 只有真正的偏移会让参考音符的音高在对应时刻的帧激活上亮起来。
-  // --frames=<缓存目录> 时启用:对 [估计值 ± 2 拍] 的候选逐一计算平均音高激活。
+  // --frames=<缓存目录> 时启用;搜索范围与可信度判定与数据工厂共用 ref-core.disambiguateByPitch。
   const framesDir = flag('frames')
   if (framesDir) {
     const readF32 = (p: string) => {
@@ -143,38 +143,13 @@ async function main() {
     }
     const meta = JSON.parse(readFileSync(join(framesDir, 'frame-cache.meta.json'), 'utf8')) as { nFrames: number; nBins: number }
     const framesF = readF32(join(framesDir, 'frame-cache.frames.f32'))
-    const pitchAt = (t: number, midi: number): number => {
-      const b = midi - 21
-      if (b < 0 || b >= meta.nBins) return 0
-      const f0 = Math.max(0, bpTimeToFrame(Math.max(0, t)))
-      const f1 = Math.min(meta.nFrames - 1, bpTimeToFrame(t + 0.06))
-      let m = 0
-      for (let f = f0; f <= f1; f++) m = Math.max(m, framesF[f * meta.nBins + b])
-      return m
+    const all = eventFiles.flatMap((f) => (JSON.parse(readFileSync(f, 'utf8')) as { events: Ev[] }).events)
+    const d = disambiguateByPitch({ offset: fit.a, scale: fit.b }, 60 / 150, all, { framesF, nFrames: meta.nFrames, nBins: meta.nBins })
+    if (!d.ok) {
+      console.error(`✗ 对齐不可信:${d.reason}(未写 align.json)`)
+      process.exit(2)
     }
-    const beatSec = 60 / 150
-    const sampleEvs: Ev[] = []
-    {
-      const all = eventFiles.flatMap((f) => (JSON.parse(readFileSync(f, 'utf8')) as { events: Ev[] }).events)
-      for (let i = 0; i < all.length; i += Math.max(1, Math.floor(all.length / 400))) sampleEvs.push(all[i])
-    }
-    let bestK = 0
-    let bestS = -1
-    for (let k = -3; k <= 3; k++) {
-      const off = fit.a + k * beatSec
-      const s = sampleEvs.reduce((a, e) => a + pitchAt(off + fit.b * e.t, e.midi), 0) / sampleEvs.length
-      console.log(`  音高消歧:offset ${(off).toFixed(3)}s(k=${k})→ 平均激活 ${s.toFixed(3)}`)
-      if (s > bestS) {
-        bestS = s
-        bestK = k
-      }
-    }
-    if (bestK !== 0) {
-      console.log(`→ 音高证据否决了起音估计:offset 修正 ${bestK} 拍(${(bestK * beatSec).toFixed(2)}s)→ ${(fit.a + bestK * beatSec).toFixed(3)}s`)
-      fit.a += bestK * beatSec
-    } else {
-      console.log(`→ 音高证据确认起音估计(0 拍偏移)`)
-    }
+    fit.a = d.offset
   }
 
   writeFileSync(isAbsolute(outFile) ? outFile : join(root, outFile), JSON.stringify({

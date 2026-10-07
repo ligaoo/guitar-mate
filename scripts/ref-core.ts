@@ -230,45 +230,86 @@ export function alignScoreToAudio(scoreOnsets: number[], audioOnsets: number[]):
   return { offset: fit.a, scale: fit.b, pairs: pairs.length, hitRate, residual: { med: finalRes[finalRes.length >> 1], p90: finalRes[Math.floor(finalRes.length * 0.9)] } }
 }
 
+/** 音高消歧的搜索范围与判定门槛。
+ *  范围 ±8 拍(4/4 下两小节)、半拍步进:翻唱版《God knows》的起音对齐偏了 7 拍,旧的 ±3 拍
+ *  搜不到真值,停在边界 k=3 还照常出了三元组(一致性分数与随机水平一样,门槛拦不住)。
+ *  门槛按两版录音实测标定:原曲 contrast 1.39 / margin 1.068,翻唱 1.43 / 1.052。 */
+export const DISAMB_MAX_BEATS = 8
+export const DISAMB_STEP_BEATS = 0.5
+export const DISAMB_MIN_CONTRAST = 1.2
+export const DISAMB_MIN_MARGIN = 1.03
+
+export interface DisambiguationResult {
+  offset: number
+  /** 相对起音估计的修正量(拍,半拍步进) */
+  k: number
+  bestScore: number
+  scores: Array<{ k: number; score: number }>
+  /** 最优分 / 全部候选的中位数:真偏移应明显高于"错位"的普遍水平 */
+  contrast: number
+  /** 最优分 / 距最优 ≥1 拍的候选里的最高分:重复段落会把它压到接近 1 */
+  margin: number
+  /** 最优落在搜索边界:真值可能在范围外,结果不可信 */
+  atEdge: boolean
+  ok: boolean
+  reason: string | null
+}
+
 /**
  * 音高消歧(修"差一拍"类错误):起音列车无法分辨整拍平移(±1 拍的命中率几乎相同),
  * 但**音高激活**可以——只有真正的偏移会让参考音符的音高在对应时刻亮起来。
- * 对 [估计值 ± 3 拍] 的候选逐一计算采样参考音的平均音高激活,取最大者。
+ * 对 [估计值 ± DISAMB_MAX_BEATS 拍](半拍步进)的候选逐一计算采样参考音的平均音高激活,取最大者,
+ * 并给出可信度判定:落在边界、对比度或区分度不足都判为不可信(调用方应拒绝产出训练样本)。
  */
 export function disambiguateByPitch(
-  align: AlignResult,
+  align: Pick<AlignResult, 'offset' | 'scale'>,
   beatSec: number,
-  events: ScoreEvent[],
-  cache: FrameCache,
-): { offset: number; k: number; bestScore: number; scores: Array<{ k: number; score: number }> } {
+  events: ReadonlyArray<{ t: number; midi: number }>,
+  cache: Pick<FrameCache, 'framesF' | 'nFrames' | 'nBins'>,
+): DisambiguationResult {
   const MIDI_BASE = 21
   const pitchAt = (t: number, midi: number): number => {
     const b = midi - MIDI_BASE
-    if (b < 0 || b >= cache.nBins) return 0
-    const f0 = Math.max(0, bpTimeToFrame(Math.max(0, t)))
+    if (b < 0 || b >= cache.nBins || t < 0) return 0
+    const f0 = Math.max(0, bpTimeToFrame(t))
     const f1 = Math.min(cache.nFrames - 1, bpTimeToFrame(t + 0.06))
     let m = 0
     for (let f = f0; f <= f1; f++) m = Math.max(m, cache.framesF[f * cache.nBins + b])
     return m
   }
-  const sampleEvs: ScoreEvent[] = []
-  for (let i = 0; i < events.length; i += Math.max(1, Math.floor(events.length / 400))) sampleEvs.push(events[i])
-  let bestK = 0
-  let bestS = -1
+  const sorted = [...events].sort((a, b) => a.t - b.t)
+  const sampleEvs: Array<{ t: number; midi: number }> = []
+  for (let i = 0; i < sorted.length; i += Math.max(1, Math.floor(sorted.length / 400))) sampleEvs.push(sorted[i])
   const scores: Array<{ k: number; score: number }> = []
-  for (let k = -3; k <= 3; k++) {
+  const nSteps = Math.round(DISAMB_MAX_BEATS / DISAMB_STEP_BEATS)
+  for (let i = -nSteps; i <= nSteps; i++) {
+    const k = i * DISAMB_STEP_BEATS
     const off = align.offset + k * beatSec
-    const s = sampleEvs.reduce((a, e) => a + pitchAt(off + align.scale * e.t, e.midi), 0) / sampleEvs.length
-    console.log(`  音高消歧:offset ${off.toFixed(3)}s(k=${k})→ 平均激活 ${s.toFixed(3)}`)
+    const s = sampleEvs.reduce((a, e) => a + pitchAt(off + align.scale * e.t, e.midi), 0) / Math.max(1, sampleEvs.length)
     scores.push({ k, score: s })
-    if (s > bestS) {
-      bestS = s
-      bestK = k
-    }
   }
-  if (bestK !== 0) console.log(`→ 音高证据否决了起音估计:offset 修正 ${bestK} 拍(${(bestK * beatSec).toFixed(2)}s)→ ${(align.offset + bestK * beatSec).toFixed(3)}s`)
+  const best = scores.reduce((m, x) => (x.score > m.score ? x : m), scores[0])
+  const sortedScores = scores.map((x) => x.score).sort((a, b) => a - b)
+  const median = sortedScores[sortedScores.length >> 1]
+  const far = scores.filter((x) => Math.abs(x.k - best.k) >= 1).reduce((m, x) => Math.max(m, x.score), 0)
+  const contrast = median > 0 ? best.score / median : 0
+  const margin = far > 0 ? best.score / far : 0
+  const atEdge = Math.abs(best.k) >= DISAMB_MAX_BEATS
+  const reason = atEdge
+    ? `最优修正量 ${best.k} 拍落在搜索边界(±${DISAMB_MAX_BEATS} 拍),真值可能在范围外`
+    : contrast < DISAMB_MIN_CONTRAST
+      ? `音高证据对比度 ${contrast.toFixed(2)} < ${DISAMB_MIN_CONTRAST}(谱与录音可能不是同一版本/编配)`
+      : margin < DISAMB_MIN_MARGIN
+        ? `区分度 ${margin.toFixed(3)} < ${DISAMB_MIN_MARGIN}(相距 ≥1 拍处有几乎同样好的候选,多半是重复段落)`
+        : null
+  const offset = align.offset + best.k * beatSec
+  console.log(
+    `  音高消歧:±${DISAMB_MAX_BEATS} 拍 × 半拍步 ${scores.length} 个候选 → 最优 k=${best.k}(${offset.toFixed(3)}s,平均激活 ${best.score.toFixed(3)})· 对比度 ${contrast.toFixed(2)} · 区分度 ${margin.toFixed(3)}`,
+  )
+  if (reason) console.log(`→ ⚠ 对齐不可信:${reason}`)
+  else if (best.k !== 0) console.log(`→ 音高证据否决了起音估计:offset 修正 ${best.k} 拍(${(best.k * beatSec).toFixed(2)}s)→ ${offset.toFixed(3)}s`)
   else console.log('→ 音高证据确认起音估计(0 拍偏移)')
-  return { offset: align.offset + bestK * beatSec, k: bestK, bestScore: bestS, scores }
+  return { offset, k: best.k, bestScore: best.score, scores, contrast, margin, atEdge, ok: reason === null, reason }
 }
 
 // ---------- ④ 逐音符验证 + 曲库条目 ----------

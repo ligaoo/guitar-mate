@@ -1,0 +1,511 @@
+{
+  "generatedAt": "2026-10-07T07:42:01.400Z",
+  "clipsFile": "eval/real-clips-cal.json",
+  "clips": 60,
+  "perKind": {
+    "solo": {
+      "clips": 17,
+      "holdoutClips": 13,
+      "holdout": {
+        "baseline": 0.828630003817832,
+        "current": 0.8495943435022514,
+        "best": 0.8565236457774988
+      },
+      "baseline": {
+        "ot": 0.5,
+        "ft": 0.3,
+        "mnlMult": 0.6,
+        "mel": false,
+        "minConf": 0,
+        "meanF1": 0.7972010342834713
+      },
+      "best": {
+        "key": "×0.6 conf=0",
+        "kind": "solo",
+        "ot": 0.6,
+        "ft": 0.6,
+        "mel": false,
+        "mnlMult": 0.6,
+        "minConf": 0,
+        "meanF1": 0.8480810567828946
+      },
+      "stageATop": [
+        {
+          "key": "ot0.6 ft0.6 meloff",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.8480810567828946
+        },
+        {
+          "key": "ot0.5 ft0.6 meloff",
+          "kind": "solo",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.8478424703173361
+        },
+        {
+          "key": "ot0.55 ft0.6 meloff",
+          "kind": "solo",
+          "ot": 0.55,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.8464334686115402
+        },
+        {
+          "key": "ot0.45 ft0.6 meloff",
+          "kind": "solo",
+          "ot": 0.45,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.8423173581101165
+        },
+        {
+          "key": "ot0.6 ft0.5 meloff",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.5,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.8284744221035405
+        },
+        {
+          "key": "ot0.55 ft0.5 meloff",
+          "kind": "solo",
+          "ot": 0.55,
+          "ft": 0.5,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.8276478002573091
+        },
+        {
+          "key": "ot0.5 ft0.5 meloff",
+          "kind": "solo",
+          "ot": 0.5,
+          "ft": 0.5,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.827327575172538
+        },
+        {
+          "key": "ot0.6 ft0.4 meloff",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.4,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.8228745242431907
+        },
+        {
+          "key": "ot0.55 ft0.4 meloff",
+          "kind": "solo",
+          "ot": 0.55,
+          "ft": 0.4,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.8201947862190677
+        },
+        {
+          "key": "ot0.45 ft0.5 meloff",
+          "kind": "solo",
+          "ot": 0.45,
+          "ft": 0.5,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.8198287316428374
+        }
+      ],
+      "stageBTop": [
+        {
+          "key": "×0.6 conf=0",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.8480810567828946
+        },
+        {
+          "key": "×0.6 conf=0.15",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0.15,
+          "meanF1": 0.8480810567828946
+        },
+        {
+          "key": "×0.6 conf=0.25",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0.25,
+          "meanF1": 0.8480810567828946
+        },
+        {
+          "key": "×0.6 conf=auto",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": "auto",
+          "meanF1": 0.8480810567828946
+        },
+        {
+          "key": "×0.45 conf=0",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.45,
+          "minConf": 0,
+          "meanF1": 0.8464476540713438
+        },
+        {
+          "key": "×0.45 conf=0.15",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.45,
+          "minConf": 0.15,
+          "meanF1": 0.8464476540713438
+        },
+        {
+          "key": "×0.45 conf=0.25",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.45,
+          "minConf": 0.25,
+          "meanF1": 0.8464476540713438
+        },
+        {
+          "key": "×0.45 conf=auto",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.45,
+          "minConf": "auto",
+          "meanF1": 0.8464476540713438
+        },
+        {
+          "key": "×0.3 conf=0",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.3,
+          "minConf": 0,
+          "meanF1": 0.8443917582921996
+        },
+        {
+          "key": "×0.3 conf=0.15",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.3,
+          "minConf": 0.15,
+          "meanF1": 0.8443917582921996
+        },
+        {
+          "key": "×0.3 conf=0.25",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.3,
+          "minConf": 0.25,
+          "meanF1": 0.8443917582921996
+        },
+        {
+          "key": "×0.3 conf=auto",
+          "kind": "solo",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.3,
+          "minConf": "auto",
+          "meanF1": 0.8443917582921996
+        }
+      ],
+      "melSkipped": 0
+    },
+    "comp": {
+      "clips": 17,
+      "holdoutClips": 13,
+      "holdout": {
+        "baseline": 0.6110495515008474,
+        "current": 0.6583411877078356,
+        "best": 0.7111014524239199
+      },
+      "baseline": {
+        "ot": 0.5,
+        "ft": 0.3,
+        "mnlMult": 0.6,
+        "mel": true,
+        "minConf": 0,
+        "meanF1": 0.5444623739548602
+      },
+      "best": {
+        "key": "×0.3 conf=0",
+        "kind": "comp",
+        "ot": 0.5,
+        "ft": 0.6,
+        "mel": false,
+        "mnlMult": 0.3,
+        "minConf": 0,
+        "meanF1": 0.7101004401905455
+      },
+      "stageATop": [
+        {
+          "key": "ot0.5 ft0.6 meloff",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6892706240102398
+        },
+        {
+          "key": "ot0.45 ft0.6 meloff",
+          "kind": "comp",
+          "ot": 0.45,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6859668958237631
+        },
+        {
+          "key": "ot0.5 ft0.6 melon",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": true,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6847898890836708
+        },
+        {
+          "key": "ot0.55 ft0.6 meloff",
+          "kind": "comp",
+          "ot": 0.55,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6844174840713467
+        },
+        {
+          "key": "ot0.55 ft0.6 melon",
+          "kind": "comp",
+          "ot": 0.55,
+          "ft": 0.6,
+          "mel": true,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6817483509855307
+        },
+        {
+          "key": "ot0.45 ft0.6 melon",
+          "kind": "comp",
+          "ot": 0.45,
+          "ft": 0.6,
+          "mel": true,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6815091824027104
+        },
+        {
+          "key": "ot0.6 ft0.6 melon",
+          "kind": "comp",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": true,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6771080904735971
+        },
+        {
+          "key": "ot0.6 ft0.6 meloff",
+          "kind": "comp",
+          "ot": 0.6,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6769844621716238
+        },
+        {
+          "key": "ot0.5 ft0.5 meloff",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.5,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6504224257196758
+        },
+        {
+          "key": "ot0.45 ft0.5 meloff",
+          "kind": "comp",
+          "ot": 0.45,
+          "ft": 0.5,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6493272718938073
+        }
+      ],
+      "stageBTop": [
+        {
+          "key": "×0.3 conf=0",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.3,
+          "minConf": 0,
+          "meanF1": 0.7101004401905455
+        },
+        {
+          "key": "×0.3 conf=0.15",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.3,
+          "minConf": 0.15,
+          "meanF1": 0.7101004401905455
+        },
+        {
+          "key": "×0.3 conf=0.25",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.3,
+          "minConf": 0.25,
+          "meanF1": 0.7101004401905455
+        },
+        {
+          "key": "×0.3 conf=auto",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.3,
+          "minConf": "auto",
+          "meanF1": 0.7101004401905455
+        },
+        {
+          "key": "×0.45 conf=0",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.45,
+          "minConf": 0,
+          "meanF1": 0.7025082715993681
+        },
+        {
+          "key": "×0.45 conf=0.15",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.45,
+          "minConf": 0.15,
+          "meanF1": 0.7025082715993681
+        },
+        {
+          "key": "×0.45 conf=0.25",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.45,
+          "minConf": 0.25,
+          "meanF1": 0.7025082715993681
+        },
+        {
+          "key": "×0.45 conf=auto",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.45,
+          "minConf": "auto",
+          "meanF1": 0.7025082715993681
+        },
+        {
+          "key": "×0.6 conf=0",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0,
+          "meanF1": 0.6892706240102398
+        },
+        {
+          "key": "×0.6 conf=0.15",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0.15,
+          "meanF1": 0.6892706240102398
+        },
+        {
+          "key": "×0.6 conf=0.25",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": 0.25,
+          "meanF1": 0.6892706240102398
+        },
+        {
+          "key": "×0.6 conf=auto",
+          "kind": "comp",
+          "ot": 0.5,
+          "ft": 0.6,
+          "mel": false,
+          "mnlMult": 0.6,
+          "minConf": "auto",
+          "meanF1": 0.6892706240102398
+        }
+      ],
+      "melSkipped": 0
+    }
+  }
+}

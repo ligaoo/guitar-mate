@@ -120,10 +120,13 @@ async function main() {
       },
       duration,
     )
-    const est = r.notes.map((n) => ({ start: n.start, dur: Math.max(0, n.end - n.start), midi: n.midi }))
+    const est = r.notes.map((n) => ({ start: n.start, dur: Math.max(0, n.end - n.start), midi: n.midi, conf: n.confidence }))
     const score = scoreEstRow(est, ctx)
     results.push({ id: row.id, desc: row.desc, notes: est.length, params: row, ...score })
-    console.log(`✓ ${row.id}:${est.length} 音 · 并集 F1 ${(score.vsUnion.f1 * 100).toFixed(1)}%(P ${(score.vsUnion.precision * 100).toFixed(1)}/R ${(score.vsUnion.recall * 100).toFixed(1)})`)
+    console.log(
+      `✓ ${row.id}:${est.length} 音 · 并集 F1 ${(score.vsUnion.f1 * 100).toFixed(1)}%(P ${(score.vsUnion.precision * 100).toFixed(1)}/R ${(score.vsUnion.recall * 100).toFixed(1)})` +
+        ` · 本行基线 ${(score.baseline.exactF1 * 100).toFixed(1)} → 超基线 ${((score.vsUnion.f1 - score.baseline.exactF1) * 100).toFixed(1)}`,
+    )
   }
   closeModelServer()
 

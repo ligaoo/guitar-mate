@@ -60,6 +60,8 @@ export interface SeparationOptions {
   lowCutHz?: number
   /** 低频成分上界(Hz,默认 250):bass 轨的频段 */
   bassBandHz?: number
+  /** 分块时长(秒,默认 30,控制单块内存);测试可调小以覆盖多块边界 */
+  blockSec?: number
   onProgress?: (p: number) => void
 }
 
@@ -236,26 +238,34 @@ export function separateDsp(channels: Float32Array[], sampleRate: number, opts: 
   const bassLo = bassBandHz * 0.6
   const bassHi = bassBandHz * 1.6
 
-  const blockLen = Math.max(1, Math.floor(BLOCK_SEC * sampleRate))
+  const blockLen = Math.max(1, Math.floor((opts.blockSec ?? BLOCK_SEC) * sampleRate))
   const nBlocks = Math.max(1, Math.ceil(len / blockLen))
   let totalFrames = 0
 
-  const mid = new Float32Array(blockLen + N)
-  const sid = new Float32Array(blockLen + N)
+  // 块间上下文:每块前后各多分析 ctx 个样本(一个 STFT 窗 + 谐波中值窗的一半),只输出块内区间,
+  // 这样块内每个样本都被满重叠的帧覆盖,中值滤波两侧也有完整上下文。
+  // 旧实现每块从块首直接起帧:块首 N−hop 个样本只被 1~3 帧覆盖,重叠相加归一化 1/Σwin² 在那里
+  // 把掩蔽伪迹放大上百倍(实测整曲峰值 260× 满幅,>1.0 的样本全部落在 30s 块的前 512 个样本内)。
+  const ctx = N + half * hop
+  const mid = new Float32Array(blockLen + 2 * ctx)
+  const sid = new Float32Array(blockLen + 2 * ctx)
 
   for (let b = 0; b < nBlocks; b++) {
     const b0 = b * blockLen
     const b1 = Math.min(len, b0 + blockLen)
     const segLen = b1 - b0
-    const padLen = segLen + N
+    const a0 = b0 - ctx // 分析起点(可为负:曲首前补零)
+    const padLen = segLen + 2 * ctx
     for (let i = 0; i < padLen; i++) {
-      const idx = b0 + i
-      const l = idx < len ? L[idx] : 0
-      const r = idx < len ? R[idx] : 0
+      const idx = a0 + i
+      const inside = idx >= 0 && idx < len
+      const l = inside ? L[idx] : 0
+      const r = inside ? R[idx] : 0
       mid[i] = (l + r) * 0.5
       sid[i] = (l - r) * 0.5
     }
-    const nFrames = Math.max(1, Math.ceil(padLen / hop))
+    // 只取完全落在分析区内的帧(缓冲区跨块复用,读越界会读到上一块的残留样本)
+    const nFrames = Math.max(1, Math.floor((padLen - N) / hop) + 1)
 
     // ---- 1) 复谱(M/S)与幅度谱 ----
     const reM = new Float32Array(nFrames * bins)
@@ -270,7 +280,7 @@ export function separateDsp(channels: Float32Array[], sampleRate: number, opts: 
       const off = f * hop
       const base = f * bins
       for (let i = 0; i < N; i++) {
-        br[i] = (mid[off + i] ?? 0) * win[i]
+        br[i] = mid[off + i] * win[i]
         bi[i] = 0
       }
       fftInPlace(br, bi)
@@ -280,7 +290,7 @@ export function separateDsp(channels: Float32Array[], sampleRate: number, opts: 
         magM[base + k] = Math.hypot(br[k], bi[k])
       }
       for (let i = 0; i < N; i++) {
-        br[i] = (sid[off + i] ?? 0) * win[i]
+        br[i] = sid[off + i] * win[i]
         bi[i] = 0
       }
       fftInPlace(br, bi)
@@ -350,15 +360,16 @@ export function separateDsp(channels: Float32Array[], sampleRate: number, opts: 
       applyMask(reM, imM, reS, imS, base, bins, maskB, accBM, accBS, off, padLen, win, N, mre, mim, sre, sim, br, bi)
     }
 
-    // ---- 4) 归一化,M/S → L/R(L = M+S, R = M-S,严格无损) ----
+    // ---- 4) 归一化,M/S → L/R(L = M+S, R = M-S,严格无损);只输出块内区间 ----
     for (let i = 0; i < segLen; i++) {
-      const w = wsum[i] > 1e-8 ? 1 / wsum[i] : 0
-      const gm = accGM[i] * w
-      const gs = accGS[i] * w
-      const pm = accPM[i] * w
-      const ps = accPS[i] * w
-      const bm = accBM[i] * w
-      const bs = accBS[i] * w
+      const j = ctx + i
+      const w = wsum[j] > 1e-8 ? 1 / wsum[j] : 0
+      const gm = accGM[j] * w
+      const gs = accGS[j] * w
+      const pm = accPM[j] * w
+      const ps = accPS[j] * w
+      const bm = accBM[j] * w
+      const bs = accBS[j] * w
       const o = b0 + i
       outGuitarL[o] = gm + gs
       outGuitarR[o] = gm - gs

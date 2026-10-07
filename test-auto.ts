@@ -24,13 +24,14 @@ const ok = (cond: boolean, msg: string) => {
   ok(slow <= 12, `60 BPM 时被上限 12 帧夹住(实得 ${slow})`)
 }
 
-// 2. 干净档参数(2026-10-07 真实数据寻优:60 片段/6 演奏者)+ melodia 默认关
+// 2. 干净档参数(2026-10-07 v2 扩界寻优 + holdout:ft0.60 两档最优)+ melodia 默认关
 {
   const clean = baseParams({ bpm: 100, polyphonic: false, confMedian: 0.7, density: 2, distortion: 0 })
   const comp = baseParams({ bpm: 100, polyphonic: true, confMedian: 0.35, density: 8, distortion: 0 })
-  ok(clean.onsetThresh === 0.55 && clean.frameThresh === 0.4, `干净档阈值=寻优最优(ot${clean.onsetThresh} ft${clean.frameThresh})`)
-  ok(clean.melodiaTrick === false && comp.melodiaTrick === false, 'melodia:真实数据全面无益,默认关(solo/comp 都是)')
-  ok(comp.onsetThresh === clean.onsetThresh && comp.frameThresh === clean.frameThresh, '密度不再单独抬阈值(寻优未见交互收益)')
+  ok(clean.onsetThresh === 0.55 && clean.frameThresh === 0.6, `干净独奏档 ot${clean.onsetThresh} ft${clean.frameThresh}(holdout 85.7%)`)
+  ok(comp.onsetThresh === 0.5 && comp.frameThresh === 0.6, `复音档 ot${comp.onsetThresh} ft${comp.frameThresh}(holdout 71.1%)`)
+  ok(comp.minNoteLenFrames < clean.minNoteLenFrames, `复音档最短音长更短(×0.3 vs ×0.6,快和弦敲击:${comp.minNoteLenFrames} < ${clean.minNoteLenFrames})`)
+  ok(clean.melodiaTrick === false && comp.melodiaTrick === false, 'melodia:真实数据全面无益,默认关(solo/comp 都是,第 3 次确认)')
   ok(clean.minConf <= 0.4 && clean.minConf >= 0.15, `响度阈值跟随置信度(干净素材 ${clean.minConf.toFixed(2)})`)
   ok(comp.minConf < clean.minConf, `低置信素材响度阈值更低、不删空(${comp.minConf.toFixed(2)} < ${clean.minConf.toFixed(2)})`)
 }
@@ -42,7 +43,7 @@ const ok = (cond: boolean, msg: string) => {
   ok(dist.melodiaTrick === false, '失真档关 melodia(复音也关)')
   ok(dist.recallExtract === true, '失真档启用召回聚合提取(阶段 2 实装:实测 5.9%→20.6%)')
   const edge = baseParams({ bpm: 100, polyphonic: true, confMedian: 0.35, density: 3, distortion: DISTORTION_ROUTE - 0.01 })
-  ok(edge.onsetThresh === 0.55 && edge.frameThresh === 0.4, `路由阈值两侧参数不同(阈值下方 ot${edge.onsetThresh} ft${edge.frameThresh})`)
+  ok(edge.onsetThresh === 0.5 && edge.frameThresh === 0.6, `路由阈值两侧参数不同(阈值下方 ot${edge.onsetThresh} ft${edge.frameThresh})`)
   ok(edge.recallExtract === false, '干净档不启用聚合提取(单帧双阈值已是真实数据寻优最优)')
 }
 

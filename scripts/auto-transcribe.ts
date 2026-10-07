@@ -18,7 +18,8 @@ import { basename, extname, join, resolve } from 'node:path'
 import { toMono, resampleLinear, SR } from '../src/transcription/pipeline'
 import { autoTranscribe } from '../src/transcription/auto/conductor'
 import { CALIB } from '../src/transcription/auto/quality'
-import { paramsKey, DISTORTION_ROUTE } from '../src/transcription/auto/plan'
+import { paramsKey, DISTORTION_ROUTE, distortionIndex } from '../src/transcription/auto/plan'
+import { importDefaults } from '../src/transcription/importDefaults'
 import { separateDsp, compensateLevelInPlace } from '../src/transcription/separation'
 import { TUNINGS, STANDARD_TUNING } from '../src/theory/tunings'
 import { tabToMidi, tabToText } from '../src/transcription/exporters'
@@ -39,7 +40,8 @@ const num = (n: string, d: number) => {
 const INPUT = flag('in')
 const OUT_ROOT = resolve(flag('out', 'D:/music/tab-out'))
 const NAME = (flag('name') || basename(INPUT || 'track', extname(INPUT || ''))).replace(/[\\/:*?"<>|]/g, '_').trim() || 'track'
-const MAX_FRET = num('max-fret', 15)
+/** --max-fret 未显式给出时按失真分档(与网页端导入默认值同一来源 importDefaults):失真 22、干净 15 */
+const MAX_FRET_FLAG = flag('max-fret') ? num('max-fret', 15) : null
 const ATTEMPTS = num('attempts', 3)
 const BARS = num('bars', 8)
 const BUDGET_MIN = num('budget-min', 10)
@@ -49,7 +51,7 @@ const root = process.cwd()
 
 if (!INPUT || !existsSync(INPUT)) {
   console.error(`✗ 找不到输入音频:${INPUT || '(未提供)'}`)
-  console.error('  用法:npm run auto -- --in="C:\\path\\song.ogg" [--max-fret=15] [--attempts=3] [--bars=8] [--name=曲名]')
+  console.error('  用法:npm run auto -- --in="C:\\path\\song.ogg" [--max-fret=15|22(默认按失真分档)] [--attempts=3] [--bars=8] [--name=曲名]')
   process.exit(2)
 }
 const tuning = (TUNINGS.find((t) => t.id === TUNING_ID) ?? { midi: STANDARD_TUNING }).midi
@@ -65,9 +67,6 @@ function decodeToWav(input: string, out: string, channels: 1 | 2, sampleRate: nu
 
 async function main() {
   console.log(`📥 输入:${INPUT}`)
-  console.log(
-    `🤖 自动模式:分段 ${BARS} 小节 · 每段最多 ${ATTEMPTS} 次尝试 · 预算 ${BUDGET_MIN} 分钟 · 最高品 ${MAX_FRET} · 分轨 ${SEPARATE ? '开' : '关'}`,
-  )
   if (!CALIB.enabled) {
     console.log(
       `📐 质量分只用于**同一段内的参数比较**;准确率按"档位"给实测区间(标定回归 r=${CALIB.r.toFixed(2)}、样本 ${CALIB.samples} → 不足以预测,不报预测值)`,
@@ -83,7 +82,16 @@ async function main() {
   const dec = decodeWav(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer)
 
   let pcm22 = dec.channels[0]
+  // 失真分档必须在原混音上测(分轨会改写削波/压缩指纹,在分轨产物上测会把失真曲误判成干净)
+  const mixDistortion = distortionIndex(pcm22)
+  const MAX_FRET = MAX_FRET_FLAG ?? importDefaults(mixDistortion).maxFret
+  console.log(
+    `🤖 自动模式:分段 ${BARS} 小节 · 每段最多 ${ATTEMPTS} 次尝试 · 预算 ${BUDGET_MIN} 分钟 · 最高品 ${MAX_FRET}${MAX_FRET_FLAG === null ? '(按失真分档)' : ''} · 分轨 ${SEPARATE ? '开' : '关'} · 失真指数 ${mixDistortion.toFixed(2)}`,
+  )
   if (SEPARATE) {
+    if (mixDistortion >= DISTORTION_ROUTE) {
+      console.log(`⚠ 素材是高失真混音(失真指数 ${mixDistortion.toFixed(2)}):分轨在这类素材上实测净亏(《God knows》对人工参考谱 20.6% → 18.5%),建议去掉 --separate`)
+    }
     const stWav = join(work, 'stereo.wav')
     decodeToWav(INPUT, stWav, 2, 44100)
     const stRaw = readFileSync(stWav)
@@ -103,6 +111,7 @@ async function main() {
     barsPerSegment: BARS,
     budgetMs: BUDGET_MIN * 60 * 1000,
     maxFret: MAX_FRET,
+    distortion: mixDistortion,
     onStage: (s) => {
       if (s.phase === 'infer') process.stdout.write(`\r   推理 ${s.detail ?? ''}   `)
       else if (s.phase === 'segments') process.stdout.write(`\r   自评 ${s.detail ?? ''}   `)
@@ -120,7 +129,14 @@ async function main() {
   lines.push(`- 输入:\`${INPUT}\``)
   lines.push(`- 检测 BPM:${res.bpm}(锁定度 ${(res.bpmStrength * 100).toFixed(0)}%)· 整体音准 ${res.tuningCents > 0 ? '+' : ''}${res.tuningCents}¢ · 调性 ${res.globalKey?.name ?? '未检出'}`)
   lines.push(`- 段落:${res.segments.length} 段 · 合格 ${res.summary.pass} / 待复核 ${res.summary.review} / 不合格 ${res.summary.fail}`)
-  lines.push(`- 平均质量分 ${res.summary.meanScore.toFixed(3)} · 参数尝试共 ${res.summary.totalAttempts} 次 · 触发 BPM 重估 ${res.summary.retunedSegments} 段`)
+  lines.push(
+    `- 平均质量分 ${res.summary.meanScore.toFixed(3)} · 参数尝试共 ${res.summary.totalAttempts} 次(每段最多 ${res.summary.attemptsPerSegment} 次` +
+      (res.summary.attemptsPerSegment === 1 ? ':失真档用召回聚合提取,闭环可调的参数改不动交付结果,不再空转重试' : '') +
+      ')',
+  )
+  if (res.summary.gridSuspectSegments > 0) {
+    lines.push(`- ⚠ 节奏落格差的段:${res.summary.gridSuspectSegments} 段(疑似 BPM 或第一拍不准;未自动重估,请在页面核对 BPM 并用「整体左右移动」对齐第一拍)`)
+  }
   if (res.summary.expectedF1 !== null) {
     lines.push(`- **预计音符级准确率 ${(res.summary.expectedF1 * 100).toFixed(1)}%**(标定自真实 GuitarSet,r=${CALIB.r.toFixed(2)})`)
   } else if ((res.summary.distortion ?? 0) >= DISTORTION_ROUTE) {

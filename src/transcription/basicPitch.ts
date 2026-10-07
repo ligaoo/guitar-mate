@@ -65,16 +65,18 @@ export interface BpOptions {
  *  数据来源 ACCURACY.md §2.1 / §8(真实 GuitarSet 独奏 + 合成混音复核):
  *   · 阈值 0.35/0.2 → 0.5/0.3:两个数据集上都是正收益(独奏 +6.6 点、混音 +6.6 点音符级 F1)
  *   · 独奏关掉 melodia 补音:真实独奏 +1.4 点且精确率 89.8 → 92.0
- *   · 最短音长:独奏 6 帧(24% 的标注音短于默认的 12 帧),混音 10 帧(过长会吃掉和弦切分)
- *  2026-10-07 更新(60 片段真实数据网格寻优,eval/param-sweep.json):
- *   · ft 0.3 → 0.40:两档共同最优(solo +1.8 / comp +4.6),与《God knows》闭环收敛点一致
- *   · ot 0.5 → 0.55(solo 最优;comp 两值差 0.3pt 内取统一)
- *   · mix 档也关 melodia:真实复音上开 melodia 净亏 0.6pt(合成数据的"应开"结论再次被真实数据推翻) */
+ *   · 最短音长:独奏 6 帧(24% 的标注音短于默认的 12 帧),混音按和弦切分缩短
+ *  2026-10-07 v2(60 片段扩界寻优 + holdout 留出集,eval/param-sweep-v2.json):
+ *   · **ft 0.40 → 0.60**:两档最大单项收益,且 holdout 确认(solo 85.0→85.7 / comp 65.8→71.1);
+ *     物理直觉:真实吉他录音的帧激活远高于幻觉,抬帧阈值主要删伪音。
+ *     注意 0.60 仍落在网格边界(0.3→0.6 单调上升),再往上未搜。
+ *   · comp 档最短音长 ×0.3(快和弦敲击)与 ot0.50;solo 档 ot0.55(平台区,0.5/0.55/0.6 差 <0.3pt)。
+ *   · melodia 真实数据全面无益(第 3 次确认),保持关。 */
 export const BP_PRESETS = {
   /** 干净独奏 / 单吉他录音 */
-  solo: { onsetThresh: 0.55, frameThresh: 0.4, minNoteLenFrames: 6, melodiaTrick: false, recallExtract: false },
-  /** 通用混音(整曲导入) */
-  mix: { onsetThresh: 0.55, frameThresh: 0.4, minNoteLenFrames: 10, melodiaTrick: false, recallExtract: false },
+  solo: { onsetThresh: 0.55, frameThresh: 0.6, minNoteLenFrames: 6, melodiaTrick: false, recallExtract: false },
+  /** 通用混音(整曲导入,无削波指纹) */
+  mix: { onsetThresh: 0.5, frameThresh: 0.6, minNoteLenFrames: 4, melodiaTrick: false, recallExtract: false },
   /** 失真混音·召回优先(PLAN-90 阶段 2):瓶颈是召回不是精度,阈值收紧只会把真音
    *  连同幻觉一起删掉(实测保守档 5.9% vs 召回优先 14.8%+);聚合提取把帧矩阵里
    *  被单阈值丢掉的证据捞回来,产物定位「草稿中的草稿」,靠置信度着色 + 人工修。 */

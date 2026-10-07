@@ -171,5 +171,49 @@ function makeTone(midi: number, seed: number): Float32Array {
   ok(stems.guitar[0].length === 0, '空输入返回空输出而不抛异常')
 }
 
+// ---- 7) 分块边界:块首不能有尖刺,分块处理与整段处理应一致 ----
+// 回归:旧实现每块从块首直接起帧,块首 N−hop 个样本只被 1~3 帧覆盖,重叠相加归一化 1/Σwin²
+// 在那里把掩蔽伪迹放大上百倍(真实整曲实测:峰值 260× 满幅,>1.0 的样本全部在 30s 块的块首)。
+// 这里用 1s 的块把 3.5s 信号切成 4 块,让每个块边界都落在有声区。
+{
+  const n = Math.ceil(3.5 * SR)
+  const tile = (src: Float32Array) => {
+    const out = new Float32Array(n)
+    for (let i = 0; i < n; i++) out[i] = src[i % src.length]
+    return out
+  }
+  const gL = tile(makeTone(52, 41))
+  const gR = tile(makeTone(59, 42))
+  const drums = tile(makeDrums())
+  const L = new Float32Array(n)
+  const R = new Float32Array(n)
+  for (let i = 0; i < n; i++) {
+    L[i] = 0.5 * gL[i] + 0.3 * drums[i]
+    R[i] = 0.5 * gR[i] + 0.3 * drums[i]
+  }
+  const peakOf = (chs: Float32Array[]) => chs.reduce((m, c) => c.reduce((a, v) => Math.max(a, Math.abs(v)), m), 0)
+  const blocked = separateDsp([L, R], SR, { blockSec: 1 })
+  const whole = separateDsp([L, R], SR)
+  const pkIn = peakOf([L, R])
+  const pkOut = peakOf(blocked.guitar)
+  ok(pkOut <= pkIn * 1.1, `分块输出无尖刺:峰值 ${pkOut.toFixed(3)} ≤ 1.1 × 输入峰值 ${pkIn.toFixed(3)}`)
+  const seg = (ch: Float32Array, a: number, b: number) => {
+    let s = 0
+    for (let i = a; i < b; i++) s += ch[i] * ch[i]
+    return Math.sqrt(s / Math.max(1, b - a))
+  }
+  let worst = 0
+  for (const t of [1, 2, 3]) {
+    const b = t * SR
+    const ratio = seg(blocked.guitar[0], b, b + 512) / Math.max(1e-9, seg(blocked.guitar[0], b - SR / 2, b + SR / 2))
+    worst = Math.max(worst, ratio)
+  }
+  ok(worst < 3, `块首 512 样本的能量与周围 1s 同量级(最大比值 ${worst.toFixed(2)} < 3)`)
+  let maxDiff = 0
+  for (let c = 0; c < 2; c++)
+    for (let i = 0; i < n; i++) maxDiff = Math.max(maxDiff, Math.abs(blocked.guitar[c][i] - whole.guitar[c][i]))
+  ok(maxDiff < 0.05 * peakOf(whole.guitar), `分块与整段处理一致(最大差 ${maxDiff.toFixed(4)} < 5% 峰值 ${peakOf(whole.guitar).toFixed(3)})`)
+}
+
 console.log(failed === 0 ? '全部通过 ✓' : `失败 ${failed} 项`)
 process.exit(failed === 0 ? 0 : 1)

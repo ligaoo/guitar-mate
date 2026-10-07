@@ -19,6 +19,8 @@ export interface EstNote {
   start: number
   dur: number
   midi: number
+  /** 识别置信度:指法阶段按它决定同弦冲突时谁让谁(外部引擎没有就按 1 处理) */
+  conf?: number
 }
 
 /** 分数级参考格:step = 12 细分格;string 翻转(Songsterr 0=最细 → 产品 0=最低) */
@@ -83,7 +85,7 @@ export function scoreEstRow(est: EstNote[], ctx: RefContext): EstRowScore {
       step: Math.max(0, Math.round(((n.start - ctx.align.offset) / beatSec) * 12)),
       dur: Math.max(1, Math.round((n.dur / beatSec) * 12)),
       midi: n.midi,
-      conf: 1,
+      conf: n.conf ?? 1,
     })),
     STANDARD_TUNING,
     22,
@@ -103,19 +105,19 @@ export function renderRefReport(title: string, rows: Array<{ desc: string; notes
   lines.push(`# ${title}`)
   lines.push('')
   lines.push(`- 指标口径:onset ±50ms;匹配 = 最大基数二分匹配(MIREX 风格);${ctxNote}`)
-  lines.push('- 随机基线 = 同一输出整体平移 1.37s 后的指标(与参考完全错开);任何指标接近基线即无判别力')
+  lines.push('- 随机基线 = **本行**输出整体平移 1.37s 后的同一指标(与参考完全错开)。基线随输出的音数与音高分布变化:')
+  lines.push('  音越多、参考越密,"撞上"的越多。比较参数组要看「超基线」;接近基线即无判别力。')
   lines.push('')
   lines.push('## 音符级(尺子 A)')
   lines.push('')
-  lines.push('| 参数组 | 音数 | 并集 exact F1 | P / R | onsetOnly | onset+offset | 音级 | ±12/24 | 主音 exact F1 |')
-  lines.push('|---|---|---|---|---|---|---|---|---|')
+  lines.push('| 参数组 | 音数 | 并集 exact F1 | 本行基线 | **超基线** | P / R | onsetOnly(基线) | onset+offset | 音级(基线) | ±12/24 | 主音 exact F1 |')
+  lines.push('|---|---|---|---|---|---|---|---|---|---|---|')
   for (const r of rows) {
+    const b = r.baseline
     lines.push(
-      `| ${r.desc} | ${r.notes} | **${pct(r.vsUnion.f1)}** | ${pct(r.vsUnion.precision)} / ${pct(r.vsUnion.recall)} | ${pct(r.vsUnion.onsetOnlyF1)} | ${pct(r.vsUnion.onsetOffsetF1)} | ${pct(r.vsUnion.chromaF1)} | ${pct(r.vsUnion.octaveTolF1)} | ${pct(r.vsLead.f1)} |`,
+      `| ${r.desc} | ${r.notes} | ${pct(r.vsUnion.f1)} | ${pct(b.exactF1)} | **${pct(r.vsUnion.f1 - b.exactF1)}** | ${pct(r.vsUnion.precision)} / ${pct(r.vsUnion.recall)} | ${pct(r.vsUnion.onsetOnlyF1)}(${pct(b.onsetOnlyF1)}) | ${pct(r.vsUnion.onsetOffsetF1)} | ${pct(r.vsUnion.chromaF1)}(${pct(b.chromaF1)}) | ${pct(r.vsUnion.octaveTolF1)} | ${pct(r.vsLead.f1)} |`,
     )
   }
-  const b = rows[0]?.baseline
-  if (b) lines.push(`| (随机基线,以第一行为例) | — | ${pct(b.exactF1)} | — | ${pct(b.onsetOnlyF1)} | — | ${pct(b.chromaF1)} | — | — |`)
   lines.push('')
   lines.push('## 分数级(尺子 B:量化到网格后「×弦×品」一致率)')
   lines.push('')

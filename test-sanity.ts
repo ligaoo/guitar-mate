@@ -55,6 +55,26 @@ check('超范围音进入丢弃报告(L5)', r2.dropped.length === 1 && r2.droppe
 const overlapSeq = [64, 64].map((midi, i) => ({ midi, step: 0, dur: 4 - i * 0 }))
 const rOverlap = assignFingering([{ midi: 64, step: 0, dur: 4 }, { midi: 64, step: 0, dur: 4 }], STANDARD_TUNING)
 check('同弦重叠禁用(分开两根弦)', rOverlap.notes.length === 2 && rOverlap.notes[0].string !== rOverlap.notes[1].string)
+// 同一根弦上的新起音会掐断前一个延音:无弦可换时截短前音,而不是丢掉新音
+// (E2/F2 都只能在 6 弦上弹;旧实现把 F2 当「冲突」丢掉——失真整曲上这类丢弃占指法丢音的大头)
+const rCut = assignFingering([{ midi: 40, step: 0, dur: 24 }, { midi: 41, step: 6, dur: 6 }], STANDARD_TUNING)
+check(
+  '同弦后起音截短前音而不丢音',
+  rCut.dropped.length === 0 && rCut.notes.length === 2 && rCut.notes[0].dur === 6,
+  `丢 ${rCut.dropped.length} · 前音时值 ${rCut.notes[0]?.dur}`,
+)
+// 比前音弱的同弦新音多半是泛音/重影:不截短前音,新音进丢弃报告
+const rWeak = assignFingering([{ midi: 40, step: 0, dur: 24, conf: 0.9 }, { midi: 41, step: 6, dur: 6, conf: 0.2 }], STANDARD_TUNING)
+check(
+  '同弦弱新音不掐断强前音',
+  rWeak.notes.length === 1 && rWeak.notes[0].dur === 24 && rWeak.dropped.length === 1 && rWeak.dropped[0].midi === 41,
+)
+// 同一时刻物理上按不全时,保留置信度高的音(旧实现按输入顺序贪心,先来的低置信音占了弦)
+const rConf = assignFingering([{ midi: 40, step: 0, dur: 4, conf: 0.2 }, { midi: 41, step: 0, dur: 4, conf: 0.9 }], STANDARD_TUNING)
+check(
+  '簇内按不全时保留高置信音',
+  rConf.notes.length === 1 && rConf.notes[0].midi === 41 && rConf.dropped.length === 1 && rConf.dropped[0].midi === 40,
+)
 
 // 4. 导出
 const bytes = tabToMidi(tab, 90)

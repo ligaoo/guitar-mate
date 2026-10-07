@@ -9,6 +9,7 @@ import { detectKey, type KeyGuess } from '../transcription/cleanup'
 import { refineBpm, quantizeNotes, SUBDIV, DUR_CYCLE } from '../transcription/quantize'
 import { separateBuffer } from '../transcription/preprocess'
 import { distortionIndex, DISTORTION_ROUTE } from '../transcription/auto/plan'
+import { importDefaults, presetPostOptions } from '../transcription/importDefaults'
 import TabView from '../components/TabView'
 import { GuitarSynth } from '../audio/synth'
 import { getCtx, getMaster } from '../audio/engine'
@@ -57,8 +58,8 @@ export default function TranscribePage() {
   const [ghostFilter, setGhostFilter] = useState(true)
   const [visibleBars, setVisibleBars] = useState(8)
 
-  /** 应用预设:一次设定阈值/最短音长/melodia 补音/召回提取(实测这几项互相耦合,分开调容易调坏)。
-   *  失真预设同时关掉八度重影过滤——它会把和弦内真实八度叠音当幻觉删掉(实测 −2.4pt)。 */
+  /** 应用预设:一次设定阈值/最短音长/melodia 补音/召回提取(实测这几项互相耦合,分开调容易调坏),
+   *  以及预设附带的后处理开关(八度重影过滤、自动密度——召回优先预设必须关,见 presetPostOptions)。 */
   const applyPreset = (id: BpPresetId) => {
     const p = bpPreset(id)
     setPresetId(id)
@@ -67,18 +68,20 @@ export default function TranscribePage() {
     setMinNoteLen(p.minNoteLenFrames)
     setMelodia(p.melodiaTrick)
     setRecallExtract(p.recallExtract)
-    if (p.recallExtract) setGhostFilter(false)
+    const post = presetPostOptions(id)
+    setGhostFilter(post.removeOctaveGhosts)
+    setAutoDensity(post.autoDensity)
   }
 
-  /** 素材失真分层:混音(dBFS 削波指纹)→ 干净/失真两档,决定预设与预期口径 */
-  const classifyMaterial = (buf: AudioBuffer) => {
+  /** 素材失真分层:在原混音上测失真指数(削波/压缩指纹)→ 干净/失真两档,返回指数本身 */
+  const classifyMaterial = (buf: AudioBuffer): number => {
     const chs: Float32Array[] = []
     for (let c = 0; c < buf.numberOfChannels; c++) chs.push(buf.getChannelData(c))
     const mono = toMono(chs, buf.length)
     const d = distortionIndex(resampleLinear(mono, buf.sampleRate, SR))
     setDistVal(d)
     setDistTier(d >= DISTORTION_ROUTE ? 'distorted' : 'clean')
-    return d >= DISTORTION_ROUTE
+    return d
   }
 
   // 响度过滤默认值随引擎切换:BP 的 amplitude≈响度,真实歌曲大量音符低于 0.55,
@@ -221,14 +224,15 @@ export default function TranscribePage() {
       setFileName(`${file.name}(${buf.duration.toFixed(1)}s)`)
       setSegStart(0)
       setSegLen(Math.min(4, buf.duration))
-      // 导入的音频文件几乎都是完整混音(含人声/贝斯/鼓):默认切换到复音 AI 引擎,
-      // 单音 DSP 引擎对整首歌只会输出垃圾;录音(现场单音)则默认 DSP
-      setEngine('bp')
-      setMinConf(0.25)
-      setSeparate(true) // 导入的音频几乎都是完整混音,默认开启分轨预处理
-      // 素材分层:高失真混音走召回优先预设(草稿定位);干净混音走通用混音预设
-      if (classifyMaterial(buf)) applyPreset('dist')
-      else applyPreset('mix')
+      // 导入的音频文件几乎都是完整混音(含人声/贝斯/鼓):默认复音 AI 引擎(单音 DSP 引擎
+      // 对整首歌只会输出垃圾;录音则默认 DSP)。其余默认值按失真分档,与回归测试共用 importDefaults:
+      // 失真混音 → 召回优先预设 + 不分轨 + 关自动密度 + 22 品;干净混音 → 通用混音预设 + 分轨
+      const def = importDefaults(classifyMaterial(buf))
+      setEngine(def.engine)
+      setMinConf(def.minConf)
+      setSeparate(def.separate)
+      setMaxFret(def.maxFret)
+      applyPreset(def.presetId) // 同时设好八度重影过滤与自动密度
       setFromMic(false)
     } catch {
       setErrMsg('无法解码该音频文件,请换 mp3/wav/m4a 格式。')
@@ -898,11 +902,11 @@ export default function TranscribePage() {
               <div className="chip-row">
                 <span className="muted small">识别预设:</span>
                 <button className={`chip${presetId === 'solo' ? ' active' : ''}`} onClick={() => applyPreset('solo')}
-                  title="干净独奏/单吉他录音:ot0.55/ft0.40、最短音长 6 帧、关 melodia。真实 GuitarSet 寻优 83.35%">
+                  title="干净独奏/单吉他录音:ot0.55/ft0.60、最短音长 6 帧、关 melodia。v2 扩界寻优 + holdout 留出集:85.7%(n=13)">
                   🎸 干净独奏
                 </button>
                 <button className={`chip${presetId === 'mix' ? ' active' : ''}`} onClick={() => applyPreset('mix')}
-                  title="通用混音(整曲导入,无削波指纹):ot0.55/ft0.40、最短音长 10 帧、关 melodia">
+                  title="通用混音(整曲导入,无削波指纹):ot0.50/ft0.60、最短音长 4 帧、关 melodia。v2 holdout:comp 档 71.1%(原 65.8%)">
                   🎚 通用混音
                 </button>
                 <button className={`chip${presetId === 'dist' ? ' active' : ''}`} onClick={() => applyPreset('dist')}
@@ -950,14 +954,15 @@ export default function TranscribePage() {
         {/* 能力分层(PLAN-90 阶段 5):按素材判定给出诚实预期,不承诺一键完美 */}
         {audio && distTier === 'distorted' && (
           <div className="warn-box mt">
-            🔥 素材判定:<b>高失真混音</b>(失真指数 {distVal.toFixed(2)},路由阈值 {DISTORTION_ROUTE})——已自动切换「🔥 失真优先」预设(召回优先 + 聚合提取)。
-            诚实预期:这类素材的盲扒产物是<b>草稿</b>(实测《God knows》对人工参考谱一致度约 21%,已接近该类素材公开最好水平;阈值理论上限 26%)。
+            🔥 素材判定:<b>高失真混音</b>(失真指数 {distVal.toFixed(2)},路由阈值 {DISTORTION_ROUTE})——已自动切换「🔥 失真优先」预设(召回优先 + 聚合提取),
+            并按实测关闭了分轨预处理与自动密度、最高品放到 22(这三项在失真混音上都是净亏,手动打开会明显变差)。
+            诚实预期:这类素材的盲扒产物是<b>草稿</b>(实测《God knows》原曲与翻唱两版录音,对人工参考谱的音符级一致度约 20%)。
             修谱顺序:先看谱面<b>橙色低置信音</b> → 用「⇄ A/B 对比」逐段核对 → 网上若有现成谱(Songsterr 等),仓库 REF 模式可直接得到人工谱水平的曲库(导入即用)。
           </div>
         )}
         {audio && distTier === 'clean' && (
           <div className="muted small mt">
-            🎸 素材判定:干净(失真指数 {distVal.toFixed(2)})。干净独奏录音的音符级准确率约 83%(真实 GuitarSet 30 片段,onset ±50ms + 音高全等);混音导入请保持「🎛 分轨预处理」开。
+            🎸 素材判定:干净(失真指数 {distVal.toFixed(2)})。干净独奏录音的音符级准确率约 86%(真实 GuitarSet,v2 扩界寻优 + holdout 验证 85.7%;onset ±50ms + 音高全等);混音导入请保持「🎛 分轨预处理」开。
           </div>
         )}
         {status === 'error' && <div className="warn-box mt">{errMsg}</div>}
@@ -1116,7 +1121,7 @@ export default function TranscribePage() {
                 <button
                   className={`chip${autoDensity ? ' active' : ''}`}
                   onClick={() => setAutoDensity(!autoDensity)}
-                  title="音符过多时按响度自动升阈值,只保留最响的主声部(≤3 音符/秒)。只在长素材(>90s)上生效,且响度 >0.6 的强音永远不会被删"
+                  title="音符过多时按响度自动升阈值,只保留最响的主声部(≤3 音符/秒)。只在长素材(>90s)上生效,且响度 >0.6 的强音永远不会被删。「🔥 失真优先」预设下默认关:失真混音的节奏吉他远超 3 音符/秒,打开会把召回优先的输出砍掉约 80%"
                 >
                   🎚 自动密度{autoDensity ? '开' : '关'}
                 </button>
