@@ -25,6 +25,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Test(算法自测 + 评测链路冒烟 + 真实数据回归)
+        run: npm test
       - name: Build
         run: npm run build
       - uses: actions/configure-pages@v5

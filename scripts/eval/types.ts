@@ -46,6 +46,14 @@ export interface EvalClip {
   detuneCents: number
   /** 参考音高,默认 440 */
   a4: number
+  /** 真实录音(优先于合成渲染):GuitarSet 等带标注数据集的音频文件。
+   *  存在时跳过渲染,直接解码该文件;truth 仍取 tracks 里的标注(需自行转换成 EvalNote)。 */
+  audio?: {
+    /** 相对仓库根的 WAV 路径(支持 16/24/32 位整数 PCM 与 32/64 位浮点) */
+    path: string
+    /** 声道选择(默认 0;立体声可取 0 或 'mix') */
+    channel?: number | 'mix'
+  }
 }
 
 /** 被评分的乐器:只有它会与 ground truth 比对(鼓没有音高,不算音符) */

@@ -6,7 +6,10 @@
 //   ③ 多 Worker 并行 CPU(主线程 GL 也不可用时)
 //   ④ 单 Worker CPU 兜底(慢,但一定有结果)
 // 长音频按 60s 分块推理,避免一次性构建数百 MB 的帧张量
-import { toMono, resampleLinear, estimateBpm, estimateBpmFromEnvelope, SR, type TranscribeResult, type RawNote } from './pipeline'
+import { toMono, resampleLinear, estimateBpm, estimateBpmFromEnvelope, estimateOnsets, arbitrateBpm, SR, type TranscribeResult, type RawNote } from './pipeline'
+import { estimateTuningFromPcm, shiftFramesPitch } from './tuning'
+import { snapClustersToChords, fitsChord } from './cleanup'
+import { retimeNotesToOnsets, pickAnchor } from './timing'
 
 // 模型路径按运行上下文解析:页面里相对页面(支持子路径部署);
 // Worker 里相对 worker 脚本(位于 assets/ 下,回退一级);
@@ -21,10 +24,28 @@ const MODEL_URL = (() => {
 type BpModule = typeof import('@spotify/basic-pitch')
 
 export interface BpOptions {
-  onsetThresh?: number // 起音阈值,越低越灵敏(默认 0.35)
-  frameThresh?: number // 延音阈值(默认 0.2)
-  minNoteLenFrames?: number // 最短音符(帧,86fps;默认 12 ≈ 140ms,16 分音符可检出)
-  removeOctaveGhosts?: boolean // 去除同时段的八度重影(默认开;和弦含真八度时应关闭)
+  onsetThresh?: number // 起音阈值,越低越灵敏(默认见 BP_PRESETS;真实录音 0.5 明显优于旧的 0.35)
+  frameThresh?: number // 延音阈值(默认见 BP_PRESETS)
+  minNoteLenFrames?: number // 最短音符(帧,86fps;默认见 BP_PRESETS)
+  /** melodia 残差补音:在 onset 驱动之外再从剩余能量里补音符。
+   *  实测(真实 GuitarSet):独奏录音上关掉更好(去伪音),混音上开更好(补同时发声)→ 按场景分流 */
+  melodiaTrick?: boolean
+  /** 召回优先提取(PLAN-90 阶段 2,失真混音用):不再用包内 outputToNotesPoly 的
+   *  单帧双阈值,改为「帧激活分段(带 droop 容忍)+ onset 联合 + 持续门限」的聚合提取。
+   *  依据:同一帧矩阵上阈值 oracle 能到 26% 而单阈值只有 ~15%(瓶颈是召回,见
+   *  PLAN-90 §1.3);true = 用默认参数,也可显式传参。 */
+  recallExtract?: boolean | RecallExtractParams
+  /** 起音对时:用 DSP 起音检测(实测偏差 ≤3.4ms)修正 BP 的帧量化起点(默认开)。
+   *  需要调用方通过 `retimeOnsets` 传入起音表;不传则自动在推理前用同一份音频算一次 */
+  retime?: boolean
+  /** 预计算的起音表(秒):由 transcribeWithBasicPitchChannels 自动填充,或调用方传入 */
+  retimeOnsets?: number[]
+  removeOctaveGhosts?: boolean // 去除同时段的八度重影(默认开;和弦含真八度时应关闭。
+  // **召回提取模式下默认关**:该过滤器在干净独奏上标定,会把失真吉他和弦里的真实
+  // 八度叠音当幻觉删掉——实测《God knows》并集 F1 20.6%(关)vs 18.2%(开),见 PLAN-90 阶段 2)
+  /** 八度重影过滤的例外:弱八度音若处在"和弦形态的 ≥3 音同时发声簇"里,判为真实八度加倍而保留。
+   *  默认开(ACCURACY.md §4.2);实测口径见 test-bp-post.ts 与 EVAL.md 复核表 */
+  octaveChordKeep?: boolean
   mergeSplits?: boolean // 合并同一音高、首尾相接的被拆音符(默认开)
   forceCpu?: boolean // 跳过 WebGL 直接用 CPU(看门狗回退 / 并行模式)
   modelUrl?: string // 模型地址:由主线程按页面地址解析后传给 worker(dev 与构建环境统一)
@@ -32,6 +53,149 @@ export interface BpOptions {
   lowestMidi?: number // MIDI 音域下限(默认 36):按调弦传入可保住 Drop D/DADGAD 的低音 D2=38
   highestMidi?: number // MIDI 音域上限(默认 90):按调弦+最高品传入
   maxHz?: number // 音域上限(默认 1350Hz ≈ 22 品高音弦):切掉镲片泛音等超声垃圾
+  autoTune?: boolean // 全曲音准校准(默认开):估计整体音分偏移并在帧域移位校正,±50 音分内消除系统性半音错音
+  tuningCents?: number // 实测的整体音分偏移(YIN 物理测量,由 transcribeWithBasicPitchChannels 自动填充或调用方传入);不传则不做帧移位
+  bpmHint?: number // 分离鼓轨上估计的 BPM:自身包络锁定不住(strength<0.1)时采用
+  bassNotes?: { start: number; end: number; midi: number }[] // 分离贝斯轨的单音线:bassGhostPrune 开启时用于修剪贝斯谐波幽灵
+  bassGhostPrune?: boolean // 贝斯谐波幽灵修剪(默认关:合成样例上净收益 ≈ 0,真实数据评测后再默认开)
+  chordSnap?: boolean // 和弦词典 snap(默认开):同时发音簇向可行和弦音级吸附,单音最多修 1 半音
+}
+
+/** 识别预设:把"独奏"与"混音"两组实测最优参数固化下来,UI 一键切换。
+ *  数据来源 ACCURACY.md §2.1 / §8(真实 GuitarSet 独奏 + 合成混音复核):
+ *   · 阈值 0.35/0.2 → 0.5/0.3:两个数据集上都是正收益(独奏 +6.6 点、混音 +6.6 点音符级 F1)
+ *   · 独奏关掉 melodia 补音:真实独奏 +1.4 点且精确率 89.8 → 92.0
+ *   · 最短音长:独奏 6 帧(24% 的标注音短于默认的 12 帧),混音 10 帧(过长会吃掉和弦切分)
+ *  2026-10-07 更新(60 片段真实数据网格寻优,eval/param-sweep.json):
+ *   · ft 0.3 → 0.40:两档共同最优(solo +1.8 / comp +4.6),与《God knows》闭环收敛点一致
+ *   · ot 0.5 → 0.55(solo 最优;comp 两值差 0.3pt 内取统一)
+ *   · mix 档也关 melodia:真实复音上开 melodia 净亏 0.6pt(合成数据的"应开"结论再次被真实数据推翻) */
+export const BP_PRESETS = {
+  /** 干净独奏 / 单吉他录音 */
+  solo: { onsetThresh: 0.55, frameThresh: 0.4, minNoteLenFrames: 6, melodiaTrick: false, recallExtract: false },
+  /** 通用混音(整曲导入) */
+  mix: { onsetThresh: 0.55, frameThresh: 0.4, minNoteLenFrames: 10, melodiaTrick: false, recallExtract: false },
+  /** 失真混音·召回优先(PLAN-90 阶段 2):瓶颈是召回不是精度,阈值收紧只会把真音
+   *  连同幻觉一起删掉(实测保守档 5.9% vs 召回优先 14.8%+);聚合提取把帧矩阵里
+   *  被单阈值丢掉的证据捞回来,产物定位「草稿中的草稿」,靠置信度着色 + 人工修。 */
+  dist: { onsetThresh: 0.35, frameThresh: 0.3, minNoteLenFrames: 6, melodiaTrick: false, recallExtract: true },
+} as const satisfies Record<string, Required<Pick<BpOptions, 'onsetThresh' | 'frameThresh' | 'minNoteLenFrames' | 'melodiaTrick' | 'recallExtract'>>>
+
+export type BpPresetId = keyof typeof BP_PRESETS
+
+/** 召回优先聚合提取的参数(2026-10-07 在《God knows》帧缓存上网格寻优,取平台区
+ *  而非单点最优:frameGate 0.22/0.25/0.28 三档 F1 相差 <0.5pt,孤本样本上的尖峰无意义)。
+ *  实测(并集 6911 参考音,onset ±50ms + 音高全等,最大二分匹配):全链路 F1 20.6%、
+ *  输出 4072 音(vs 单帧双阈值最优 15.4%、阈值 oracle 26%)——满足 PLAN-90 阶段 2
+ *  出口判据(F1 ≥20%、≥3000 音)。消融:强制八度过滤 −2.4pt(失真吉他和弦内真八度
+ *  叠音被误删)→ 召回模式下该过滤默认关。 */
+export interface RecallExtractParams {
+  /** 段落门限:帧激活 ≥ 此值开始记段(段内跌破后仍有 droopFrames 的容忍) */
+  frameGate: number
+  /** onset 联合门限:段首附近的 onset 峰值 ≥ 此值 → 接受该音(起音证据) */
+  onsetGate: number
+  /** 持续门限:无 onset 支撑时,段内峰值激活需 ≥ 此值才接受(延音证据) */
+  sustainGate: number
+  /** 段内激活跌破段落门限的容忍帧数(melodia 式 droop,把被掩蔽的持续音接回来) */
+  droopFrames: number
+}
+
+export const RECALL_EXTRACT_DEFAULTS: RecallExtractParams = {
+  frameGate: 0.22,
+  onsetGate: 0.25,
+  sustainGate: 0.35,
+  droopFrames: 3,
+}
+
+/**
+ * 召回优先聚合提取:帧+onset 矩阵 → 音符(不经包内 outputToNotesPoly)。
+ *
+ * 与单帧双阈值(onsetThresh/frameThresh 各卡一道)的区别:
+ *   ① 分段用**低门限 + droop 容忍**——失真混音里真实音的帧激活常被掩蔽得忽高忽低,
+ *      单阈值会把它拆碎或整段丢掉;
+ *   ② 接受判据是**聚合证据**:段首 onset 峰值(起音)或段内持续峰值(延音)二选一达标,
+ *      而不是每一帧各自过线;
+ *   ③ conf 是聚合分(0.55×onset 峰 + 0.45×段均值),下游的置信过滤/八度清理仍可用。
+ * 时值先验由调用方的 minNoteLenFrames 承担(BPM 推导,见 plan.baseParams)。
+ */
+export function extractNotesAggressive(
+  frames: number[][],
+  onsets: number[][],
+  params: RecallExtractParams,
+  opts: { minNoteLenFrames?: number; lowestMidi?: number; highestMidi?: number } = {},
+): RawNote[] {
+  const nFrames = frames.length
+  if (!nFrames) return []
+  const nBins = frames[0]?.length ?? 88
+  const p = { ...RECALL_EXTRACT_DEFAULTS, ...params }
+  const mnl = Math.max(1, opts.minNoteLenFrames ?? 4)
+  const lo = Math.max(0, (opts.lowestMidi ?? 36) - 21)
+  const hi = Math.min(nBins - 1, (opts.highestMidi ?? 90) - 21)
+  const out: RawNote[] = []
+  const droorFloor = p.frameGate * 0.5
+  for (let b = lo; b <= hi; b++) {
+    let f = 0
+    while (f < nFrames) {
+      if (frames[f][b] < p.frameGate) {
+        f++
+        continue
+      }
+      // ---- 一段的开始:带 droop 容忍地向后扩展 ----
+      let end = f
+      let gap = 0
+      let peak = frames[f][b]
+      let sum = 0
+      let cnt = 0
+      let g = f
+      while (g < nFrames) {
+        const v = frames[g][b]
+        if (v >= p.frameGate) {
+          end = g
+          gap = 0
+          if (v > peak) peak = v
+          sum += v
+          cnt++
+        } else if (v >= droorFloor && gap < p.droopFrames) {
+          gap++
+        } else {
+          break
+        }
+        g++
+      }
+      const len = end - f + 1
+      // 段首 onset 峰值(起音头常先于帧激活 1~3 帧,前后都搜)
+      let onsetPeak = 0
+      let onsetAt = f
+      for (let k = Math.max(0, f - 3); k <= Math.min(nFrames - 1, f + 4); k++) {
+        const ov = onsets[k]?.[b] ?? 0
+        if (ov > onsetPeak) {
+          onsetPeak = ov
+          onsetAt = k
+        }
+      }
+      const accept = onsetPeak >= p.onsetGate || (peak >= p.sustainGate && len >= mnl)
+      if (accept && len >= Math.min(3, mnl)) {
+        const meanAct = cnt > 0 ? sum / cnt : peak
+        const conf = Math.max(0, Math.min(1, 0.55 * onsetPeak + 0.45 * meanAct))
+        const startF = onsetPeak >= p.onsetGate ? Math.min(f, onsetAt) : f
+        out.push({
+          start: bpFrameTimeSec(startF),
+          end: bpFrameTimeSec(end + 1),
+          midi: b + 21,
+          confidence: conf,
+          velocity: conf,
+        })
+      }
+      f = Math.max(g, f + 1)
+    }
+  }
+  out.sort((a, b2) => a.start - b2.start || a.midi - b2.midi)
+  return mergeAdjacentSamePitch(out, 0.06)
+}
+
+/** 取预设(带缺省),供页面与评测共用,避免两边默认值再次漂移 */
+export function bpPreset(id: BpPresetId): Required<Pick<BpOptions, 'onsetThresh' | 'frameThresh' | 'minNoteLenFrames' | 'melodiaTrick' | 'recallExtract'>> {
+  return { ...BP_PRESETS[id] }
 }
 
 /** 初始化 TF.js 后端:优先 WebGL;虚拟显示驱动下 GL 推理会挂死,由看门狗回退并行 CPU */
@@ -62,9 +226,34 @@ interface BpChannelsRequest extends BpOptions {
   postOnWorker?: boolean // 重后处理(melodia)发回常驻 Worker:主线程 GL 路径下避免长音频提取阶段冻结页面
 }
 
-const FPS = Math.floor(22050 / 256) // 86 帧/秒
+const FPS = Math.floor(22050 / 256) // 名义 86(只用于"名义帧数"换算;真实时基见下方工具函数)
 const WINDOW_SAMPLES = 22050 * 2 - 256 // 模型窗口 2s
 const CHUNK_SAMPLES = 60 * 22050 // 每块 60s
+
+// ---- BP 帧轴的**真实**时基(2026-10-07 修复,背景见 PLAN-90 阶段 0 / AUTO.md §7.5)----
+// 包内滑窗:每窗输入 43844 采样、步进 HOP_SIZE=36164 采样,unwrap 后每窗贡献 142 帧
+// → 有效帧率 22050×142/36164 ≈ **86.582**,不是名义 86。
+// 音符时间由 toMidi.modelFrameToTime 生成:帧 k → k×256/22050 − 窗偏移×⌊k/172⌋。
+// 旧分块按名义 60s 推进,但保留的 5160 帧只覆盖 59.609s → 每块边界丢 0.391s,
+// 块 c 的音符整体提前 0.391×c 秒(>60s 音频全错位;评测片段均 <60s 故从未暴露)。
+const BP_WIN_FRAMES = 172 // toMidi 的窗口帧数(ANNOT_N_FRAMES = 86×2)
+const BP_WIN_OFFSET = (256 / 22050) * (BP_WIN_FRAMES - 43844 / 256) + 0.0018 // ≈0.010327s,与 toMidi.ts 同式
+/** 帧轴真实帧率(≈86.582)——凡"帧数↔秒"换算一律用它或下面两个函数,禁止再用名义 86 */
+export const BP_FPS_TRUE = (22050 * 142) / 36164
+/** 帧 k 对应的真实音频时间(秒),与包内 modelFrameToTime 一致 */
+export function bpFrameTimeSec(k: number): number {
+  return (k * 256) / 22050 - BP_WIN_OFFSET * Math.floor(k / BP_WIN_FRAMES)
+}
+/** 前 n 帧覆盖的真实音频时长(秒)。分块推进必须用它,而不是名义 n/86 */
+export function bpFrameSpanSec(n: number): number {
+  return n > 0 ? bpFrameTimeSec(n) : 0
+}
+/** 音频时间(秒)→ 帧序号(modelFrameToTime 的数值逆,一次迭代收敛到 ±1 帧) */
+export function bpTimeToFrame(t: number): number {
+  let k = Math.round((t * 22050) / 256)
+  k = Math.round(((t + BP_WIN_OFFSET * Math.floor(k / BP_WIN_FRAMES)) * 22050) / 256)
+  return Math.max(0, k)
+}
 
 let modulePromise: Promise<BpModule> | null = null
 let modelPromise: Promise<InstanceType<BpModule['BasicPitch']>> | null = null
@@ -152,11 +341,14 @@ export async function evaluateChunked(
       (p) => onProgress((ci + p) / nChunks),
     )
     const nominal = Math.floor((span * FPS) / SR)
-    for (let i = 0; i < Math.min(nominal, cf.length); i++) {
+    const kept = Math.min(nominal, cf.length)
+    for (let i = 0; i < kept; i++) {
       frames.push(cf[i])
       onsets.push(co[i])
     }
-    start += span
+    // 块推进 = 保留帧覆盖的**真实**时长(名义 60s 的块实际覆盖 59.609s)。
+    // 差值部分由下一块的重叠上下文覆盖;末块尾部 <0.4% 音频不出帧(可忽略)。
+    start += Math.max(1, Math.round(bpFrameSpanSec(kept) * SR))
     ci++
     await yieldToEventLoop()
   }
@@ -172,32 +364,81 @@ export async function postProcessFrames(
 ): Promise<TranscribeResult> {
   const m = loadedModule ?? (await getModule())
   loadedModule = m
+  // 未指定场景时按"通用混音"预设兜底(页面/评测都会显式传预设值)
+  const preset: Required<Pick<BpOptions, 'onsetThresh' | 'frameThresh' | 'minNoteLenFrames' | 'melodiaTrick'>> = BP_PRESETS.mix
+  const onsetThresh = opts.onsetThresh ?? preset.onsetThresh
+  const frameThresh = opts.frameThresh ?? preset.frameThresh
+  const minNoteLenFrames = opts.minNoteLenFrames ?? preset.minNoteLenFrames
+  const melodiaTrick = opts.melodiaTrick ?? preset.melodiaTrick
+  // 全曲音准校准:帧域分数半音移位(±50 音分内)。等价于先把音频校准再推理,
+  // 但省掉重采样/重推理,且完全不碰时间轴(起音、节拍、A/B 对比不受影响)。
+  // 偏移量由调用方用 YIN 物理测量并经 opts.tuningCents 传入——BP 帧激活是
+  // 分类器输出,会向半音格收缩,不能用来测自身偏移(见 tuning.ts 注释)。
+  let framesUse = frames
+  let tuningCents: number | undefined
+  if (opts.autoTune !== false && opts.tuningCents !== undefined && Number.isFinite(opts.tuningCents) && opts.tuningCents !== 0) {
+    framesUse = shiftFramesPitch(frames, opts.tuningCents / 100)
+    onsets = shiftFramesPitch(onsets, opts.tuningCents / 100)
+    tuningCents = Math.round(opts.tuningCents)
+  }
   // 音域限频在音符生成之前生效(constrainFrequency 直接抹掉帧矩阵):整曲混识别时
-  // 贝斯/底鼓(<70Hz)与镲片泛音(>1350Hz)不会变成音符
-  const events = m.outputToNotesPoly(
-    frames,
-    onsets,
-    opts.onsetThresh ?? 0.35,
-    opts.frameThresh ?? 0.2,
-    opts.minNoteLenFrames ?? 12,
-    true,
-    opts.maxHz ?? 1350,
-    opts.minHz ?? 70,
-    true,
-  )
-  const timed = m.noteFramesToTime(events)
-  let notes: RawNote[] = timed
-    .map((n) => ({
-      start: n.startTimeSeconds,
-      end: n.startTimeSeconds + Math.max(0.08, n.durationSeconds),
-      midi: n.pitchMidi,
-      confidence: Math.max(0, Math.min(1, n.amplitude)),
-      velocity: Math.max(0, Math.min(1, n.amplitude)),
-    }))
-    .filter((n) => n.midi >= (opts.lowestMidi ?? 36) && n.midi <= (opts.highestMidi ?? 90))
+  // 贝斯/底鼓(<70Hz)与镲片泛音(>1350Hz)不会变成音符。
+  // 召回优先分支(失真混音)不经 outputToNotesPoly:单帧双阈值会把被掩蔽的真实音
+  // 整段丢掉,改用聚合提取(帧分段+onset联合+持续门限,见 extractNotesAggressive)。
+  let notes: RawNote[]
+  if (opts.recallExtract) {
+    const rp = opts.recallExtract === true ? RECALL_EXTRACT_DEFAULTS : opts.recallExtract
+    notes = extractNotesAggressive(framesUse, onsets, rp, {
+      minNoteLenFrames,
+      lowestMidi: opts.lowestMidi ?? 36,
+      highestMidi: opts.highestMidi ?? 90,
+    })
+  } else {
+    const events = m.outputToNotesPoly(
+      framesUse,
+      onsets,
+      onsetThresh,
+      frameThresh,
+      minNoteLenFrames,
+      true,
+      opts.maxHz ?? 1350,
+      opts.minHz ?? 70,
+      melodiaTrick,
+    )
+    const timed = m.noteFramesToTime(events)
+    notes = timed
+      .map((n) => ({
+        start: n.startTimeSeconds,
+        end: n.startTimeSeconds + Math.max(0.08, n.durationSeconds),
+        midi: n.pitchMidi,
+        confidence: Math.max(0, Math.min(1, n.amplitude)),
+        velocity: Math.max(0, Math.min(1, n.amplitude)),
+      }))
+      .filter((n) => n.midi >= (opts.lowestMidi ?? 36) && n.midi <= (opts.highestMidi ?? 90))
+  }
   notes.sort((a, b) => a.start - b.start || a.midi - b.midi)
   if (opts.mergeSplits !== false) notes = mergeAdjacentSamePitch(notes)
-  if (opts.removeOctaveGhosts !== false) notes = removeOctaveGhosts(notes)
+  // 八度重影过滤:干净素材默认开;召回提取模式默认关(在失真混音上会删掉和弦内
+  // 真实八度叠音,实测 −2.4pt F1,见 removeOctaveGhosts 注释)
+  const ghostDefault = opts.recallExtract ? false : true
+  if ((opts.removeOctaveGhosts ?? ghostDefault) !== false) {
+    notes = removeOctaveGhosts(notes, { keepChordOctaves: opts.octaveChordKeep !== false })
+  }
+  // 贝斯谐波幽灵修剪(默认关):贝斯基频被 minHz 切掉后,其 2×/4× 谐波会以
+  // "孤立的低音区八度音"残留。合成样例上净收益 ≈ 0(见 EVAL.md),真实数据评测后再默认开。
+  if (opts.bassGhostPrune && opts.bassNotes?.length) notes = pruneBassHarmonicGhosts(notes, opts.bassNotes, opts.lowestMidi ?? 36)
+  // 和弦词典 snap:同时发音簇吸附到可行和弦音级(每簇最多修一个音、最多 1 半音,保守)
+  if (opts.chordSnap !== false) notes = snapClustersToChords(notes)
+  // 起音对时:BP 的起点是 86fps 帧量化(11.6ms),用 DSP 起音(实测偏差 ≤3.4ms)修正。
+  // 放在所有"删音/改音"之后做,避免把已经被删掉的音符也算进吸附竞争者。
+  let retimed = 0
+  let anchor: number | undefined
+  if (opts.retime !== false && opts.retimeOnsets && opts.retimeOnsets.length) {
+    const r = retimeNotesToOnsets(notes, opts.retimeOnsets)
+    notes = r.notes
+    retimed = r.moved
+    anchor = pickAnchor(notes, opts.retimeOnsets)
+  }
   const onsetsT = [...new Set(notes.map((n) => +n.start.toFixed(3)))].sort((a, b) => a - b)
   // 整曲节拍:起音包络自相关(跟全曲律动,含鼓点驱动的起音),锁定不住再退回音符间隔直方图
   const env = new Float32Array(onsets.length)
@@ -207,16 +448,27 @@ export async function postProcessFrames(
     for (let i = 0; i < of.length; i++) s += of[i]
     env[f] = s
   }
-  const envBpm = estimateBpmFromEnvelope(env, FPS)
-  const bpm = envBpm.strength > 0.1 ? envBpm.bpm : estimateBpm(onsetsT).bpm
+  const envBpm = estimateBpmFromEnvelope(env, BP_FPS_TRUE)
+  const guessed =
+    envBpm.strength > 0.1
+      ? envBpm.bpm
+      : opts.bpmHint && opts.bpmHint > 0
+        ? opts.bpmHint
+        : estimateBpm(onsetsT).bpm
+  // 保守仲裁:包络在"只弹八分/分解和弦"的素材上会锁错周期(实测合成混音 4/7 把 100 读成
+  // 164/50/165/164,直接毁掉谱面网格)。用音符的"格内贴合 + 重音落拍"改写,但只在明确更优时。
+  const arb = arbitrateBpm(guessed, notes, { hint: opts.bpmHint })
+  const bpm = arb.bpm
   return {
     notes,
     onsets: onsetsT,
     bpm,
-    bpmStrength: envBpm.strength,
-    offset: onsetsT.length ? onsetsT[0] : 0,
+    bpmStrength: arb.strength > 0 ? Math.max(arb.strength, envBpm.strength) : envBpm.strength,
+    offset: anchor ?? (onsetsT.length ? onsetsT[0] : 0),
     duration,
     f0Track: new Float32Array(0),
+    tuningCents,
+    retimed,
   }
 }
 
@@ -236,6 +488,16 @@ export async function transcribeWithBasicPitchChannels(
   onStage('model', backend)
   const mono = toMono(req.channels, req.channels[0].length)
   const resampled = resampleLinear(mono, req.sampleRate, SR)
+  // 全曲音准校准的偏移量:YIN 物理测量(在此处统一计算,worker/主线程兜底/eval 三条路径共用)
+  if (req.autoTune !== false && req.tuningCents === undefined) {
+    const tune = estimateTuningFromPcm(resampled, SR)
+    req.tuningCents = tune ? Math.round(tune.semis * 100) : 0
+  }
+  // 起音对时:用同一份 22050Hz 音频跑 DSP 起音检测(与 DSP 引擎同款,实测偏差 ≤3.4ms),
+  // 后续在 postProcessFrames 里把 BP 的帧量化起点逐音吸附过去
+  if (req.retime !== false && !req.retimeOnsets) {
+    req.retimeOnsets = estimateOnsets(resampled, SR)
+  }
   let frames: number[][] = []
   let onsets: number[][] = []
   try {
@@ -270,9 +532,28 @@ export async function transcribeWithBasicPitchChannels(
 /**
  * 八度重影过滤:模型常见的「同一时间出现基频 + 高/低八度」幻觉。
  * 时间重叠超过较短音符 50% 且音高差恰为 12/24 半音 → 保留响度大的那个。
+ *
+ * 例外(可关):**真实和弦里的八度加倍**是吉他最常见的按法之一
+ * (如 E2+B2+E3 的 E 和弦把位)。若较弱的那个八度音同时与 ≥2 个其它音发声、
+ * 且这一簇的音级能落进和弦词典,则判为"和弦音"而不是幽灵,整簇保留。
+ * 双音(根音+八度)仍按原规则处理 —— 这是实测净收益 +5 点的行为,不冒险放宽。
  */
-export function removeOctaveGhosts(notes: RawNote[]): RawNote[] {
+export function removeOctaveGhosts(notes: RawNote[], opts: { keepChordOctaves?: boolean } = {}): RawNote[] {
+  const keepChordOctaves = opts.keepChordOctaves !== false
   const dead = new Set<number>()
+  // 预计算每个音所在的同时发声音簇(起音相差 ≤60ms),用于"这是和弦不是幽灵"的判据
+  const clusterOf = (i: number): RawNote[] => {
+    const a = notes[i]
+    const out = [a]
+    for (let k = 0; k < notes.length; k++) {
+      if (k === i) continue
+      const b = notes[k]
+      const overlap = Math.min(a.end, b.end) - Math.max(a.start, b.start)
+      if (overlap <= 0) continue
+      if (Math.abs(b.start - a.start) <= 0.06) out.push(b)
+    }
+    return out
+  }
   for (let i = 0; i < notes.length; i++) {
     if (dead.has(i)) continue
     for (let j = i + 1; j < notes.length; j++) {
@@ -284,12 +565,52 @@ export function removeOctaveGhosts(notes: RawNote[]): RawNote[] {
       const shorter = Math.min(a.end - a.start, b.end - b.start)
       const dOctave = Math.abs(a.midi - b.midi)
       if ((dOctave === 12 || dOctave === 24) && overlap > shorter * 0.5) {
-        if (a.velocity >= b.velocity) dead.add(j)
-        else dead.add(i)
+        const weakIdx = a.velocity >= b.velocity ? j : i
+        // 单八度差:若弱音处在"和弦形态的同时发声音簇"里,它更可能是真实的八度加倍
+        if (dOctave === 12 && keepChordOctaves) {
+          const cl = clusterOf(weakIdx)
+          if (cl.length >= 3 && fitsChord(cl.map((n) => n.midi))) continue
+        }
+        dead.add(weakIdx)
+        if (weakIdx === i) break
       }
     }
   }
   return notes.filter((_, i) => !dead.has(i))
+}
+
+/**
+ * 贝斯谐波幽灵修剪:混音里贝斯基频(常 <70Hz)被音域下限切掉后,其 2×/4× 谐波
+ * 会被模型当成"孤立的低音区音符"残留——它们与贝斯线成 ±12/24 半音且时间对齐。
+ *
+ * 两道防线防止误伤(独奏/贝斯茎被吉他低音弦污染时会反噬,实测 solo-guitar 曾被
+ * 剪掉 40% 的真实音符):
+ *   ① 只认「低于吉他音域」的贝斯参照音(真贝斯 E1~B1 区)。独奏吉他漏进贝斯茎
+ *      的成分都在吉他音域内,整批参照作废,修剪自动关闭;
+ *   ② 双重置信度门槛:既低于全体中位、也低于绝对值 0.35——真实拨弦音通常更响,
+ *      谐波残留是弱激活(实测 0.45 会误伤弱奏真音,guitar-bass 上净收益转负)。
+ */
+export function pruneBassHarmonicGhosts(
+  notes: RawNote[],
+  bass: { start: number; end: number; midi: number }[],
+  lowestGuitarMidi = 36,
+): RawNote[] {
+  // 只保留低到不可能是吉他的参照(贝斯基频区)
+  const refs = bass.filter((b) => b.midi < lowestGuitarMidi)
+  if (refs.length === 0 || notes.length === 0) return notes
+  const confs = notes.map((n) => n.confidence).sort((a, b) => a - b)
+  const medConf = confs[confs.length >> 1]
+  return notes.filter((n) => {
+    if (n.confidence >= medConf || n.confidence >= 0.35) return true
+    for (const b of refs) {
+      const d = n.midi - b.midi
+      if (d !== 12 && d !== 24) continue
+      // 起音对齐(而非时间重叠):谐波幽灵与贝斯基频同帧出现;
+      // 真实吉他双打即便同和声,拨弦时刻通常错开,且贝斯音可持续 1s+,重叠判据会大面积误伤
+      if (Math.abs(n.start - b.start) <= 0.08) return false
+    }
+    return true
+  })
 }
 
 /**
@@ -452,11 +773,19 @@ async function runParallelCpu(
   for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice())
   const mono = toMono(channels, buffer.length)
   const resampled = resampleLinear(mono, buffer.sampleRate, SR)
-  // 切块(与 evaluateChunked 同规则:块尾多带一个 2s 窗口上下文,汇总时裁掉越界帧)
+  // 起音对时表在此算一次(并行 CPU 路径也要,否则后处理拿不到时间基准)
+  if (opts.retime !== false && !opts.retimeOnsets) {
+    opts = { ...opts, retimeOnsets: estimateOnsets(resampled, SR) }
+  }
+  // 切块(与 evaluateChunked 同规则:块尾多带一个 2s 窗口上下文,汇总时裁掉越界帧;
+  // 推进按"保留帧的真实时长"而非名义时长,否则每块边界丢 0.391s —— 见 bpFrameSpanSec 注释)
   const chunkTarget = Math.ceil(resampled.length / N)
   const chunks: { start: number; span: number }[] = []
-  for (let start = 0; start < resampled.length; start += chunkTarget) {
-    chunks.push({ start, span: Math.min(chunkTarget, resampled.length - start) })
+  for (let start = 0; start < resampled.length; ) {
+    const span = Math.min(chunkTarget, resampled.length - start)
+    chunks.push({ start, span })
+    const nominal = Math.floor((span * FPS) / SR)
+    start += Math.max(1, Math.round(bpFrameSpanSec(nominal) * SR))
   }
   const total = chunks.length
   const results: { frames: number[][]; onsets: number[][] }[] = []

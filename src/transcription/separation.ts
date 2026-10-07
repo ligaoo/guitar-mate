@@ -22,7 +22,8 @@
 // M/S↔L/R 是严格无损的(L=M+S, R=M-S):掩码对 M 与 S 分别施加后合成,
 // 因此对硬左右声像的内容不会引入增益或相位误差。
 
-import { fftInPlace } from './pipeline'
+import { fftInPlace, resampleLinear, estimateBpmFromEnvelope } from './pipeline'
+import { yin, makeYinScratch } from '../audio/pitch'
 
 function ifftInPlace(re: Float32Array, im: Float32Array): void {
   const n = re.length
@@ -51,7 +52,11 @@ export interface SeparationOptions {
   centerSuppress?: number
   /** 谐波/打击乐分离(去鼓),默认 true */
   percussiveRemoval?: boolean
-  /** 吉他轨低频切除(Hz,默认 70):去掉贝斯基频与隆隆声 */
+  /** 吉他轨低频切除(Hz,默认 50)。
+   *  历史值 70 的实测问题(ACCURACY.md §2.6/D3):掩码是 ramp(0.6×, 1.6×)= 42→112Hz 的
+   *  平滑阶跃,对吉他最低弦的基频衰减 D2 −7.4dB、E2 −4.3dB,而对贝斯谐波(123/185/247Hz)
+   *  完全无效(≥110Hz 实测 0.00dB)—— 既没达到"去贝斯谐波"的目标,又削弱了最低两根弦。
+   *  50Hz 时:41Hz(E1)−17.8dB、61.7Hz(B1)−3.1dB、73.4Hz(D2)−0.42dB、82.4Hz(E2)0dB。 */
   lowCutHz?: number
   /** 低频成分上界(Hz,默认 250):bass 轨的频段 */
   bassBandHz?: number
@@ -176,7 +181,7 @@ function applyMask(
 export function separateDsp(channels: Float32Array[], sampleRate: number, opts: SeparationOptions = {}): Stems {
   const centerSuppress = Math.max(0, Math.min(1, opts.centerSuppress ?? 0.6))
   const percussiveRemoval = opts.percussiveRemoval !== false
-  const lowCutHz = opts.lowCutHz ?? 70
+  const lowCutHz = opts.lowCutHz ?? 50
   const bassBandHz = opts.bassBandHz ?? 250
   const onProgress = opts.onProgress
 
@@ -220,8 +225,14 @@ export function separateDsp(channels: Float32Array[], sampleRate: number, opts: 
 
   const half = TIME_WIN >> 1
   const fhalf = FREQ_WIN >> 1
-  const lowLo = lowCutHz * 0.6
-  const lowHi = lowCutHz * 1.6
+  // 低频切除的过渡带刻意做窄(46→69Hz @ lowCutHz=50):实测传递函数
+  //   41Hz(E1) −∞ · 50Hz −21.9dB · 61.7Hz(B1) −2.3dB · 73.4Hz(D2) 0dB · 82.4Hz(E2) 0dB
+  // 旧实现用 lowCutHz×(0.6, 1.6) = 42→112Hz 的宽带阶跃:50Hz 确实压得更死(0.036),
+  // 但把吉他最低两根弦的基频也削掉了(D2 −7.4dB / E2 −4.3dB),而对 >110Hz 的贝斯谐波
+  // 完全无效 —— 净效果是"伤了吉他、没解决贝斯"。窄带方案在 <70Hz 仍然压得住,
+  // 而 <70Hz 本来就被两个引擎的 minHz=70(BP constrainFrequency / YIN fmin)切掉。
+  const lowLo = lowCutHz * 0.92
+  const lowHi = lowCutHz * 1.38
   const bassLo = bassBandHz * 0.6
   const bassHi = bassBandHz * 1.6
 
@@ -373,4 +384,140 @@ export const dspSeparationBackend: SeparationBackend = {
   async separate(channels, sampleRate, opts) {
     return separateDsp(channels, sampleRate, opts)
   },
+}
+
+// ---- 分离产物的电平补偿 ----
+
+/** 条件式电平补偿(就地)。
+ *
+ *  动机:Basic Pitch 的输入没有归一化环节,分离后的吉他轨电平过低时整体漏检。
+ *  但 ACCURACY.md §5.4 实测:对电平正常的素材做峰值归一(到 0.9)**是负收益**(−1 点),
+ *  而且会被单个瞬态决定增益。所以这里只在「整段 RMS 明显偏轻」时向上补偿:
+ *    · RMS ≥ rmsTarget(−24dBFS)          → 完全不动
+ *    · 增益上限 maxGainDb(默认 +12dB)    → 避免把底噪一起抬起来
+ *    · 峰值不超过 peakCeil(默认 0.95)    → 避免削顶
+ *  对正常素材是恒等变换,因此不会引入"分离伤害"之外的新损失。 */
+export function compensateLevelInPlace(
+  chs: Float32Array[],
+  rmsTarget = 0.06,
+  maxGainDb = 12,
+  peakCeil = 0.95,
+): number {
+  let sum = 0
+  let n = 0
+  let peak = 0
+  for (const ch of chs) {
+    for (let i = 0; i < ch.length; i++) {
+      sum += ch[i] * ch[i]
+      n++
+      const a = Math.abs(ch[i])
+      if (a > peak) peak = a
+    }
+  }
+  if (n === 0 || peak < 1e-9) return 1
+  const rms = Math.sqrt(sum / n)
+  if (rms >= rmsTarget) return 1
+  let g = rmsTarget / rms
+  g = Math.min(g, Math.pow(10, maxGainDb / 20))
+  g = Math.min(g, peakCeil / peak)
+  if (!(g > 1.001)) return 1
+  for (const ch of chs) for (let i = 0; i < ch.length; i++) ch[i] *= g
+  return g
+}
+
+// ---- 分离副产品的再利用:鼓轨给节拍,贝斯轨给八度幽灵参照 ----
+
+export interface BassNote {
+  start: number
+  end: number
+  midi: number
+}
+
+/**
+ * 从分离出的贝斯茎提取单音线(YIN)。贝斯茎已经过低频带通,信噪比足够单音跟踪;
+ * 降采样到 5512Hz 后 YIN 逐帧,再按音高连续性聚段。用于八度幽灵修剪的参照。
+ */
+export function extractBassNotes(bass: Float32Array[], sampleRate: number): BassNote[] {
+  const len = bass[0]?.length ?? 0
+  if (len === 0) return []
+  const mono = new Float32Array(len)
+  for (const ch of bass) for (let i = 0; i < len; i++) mono[i] += ch[i] / bass.length
+  const DS_SR = 5512 // 贝斯基频 <200Hz,4× 降采样足够
+  const ds = resampleLinear(mono, sampleRate, DS_SR)
+  const FRAME = 1024
+  const HOP = 256
+  const n = Math.max(0, Math.floor((ds.length - FRAME) / HOP) + 1)
+  if (n < 4) return []
+  const scratch = makeYinScratch(FRAME, DS_SR, 35)
+  const buf = new Float32Array(FRAME)
+  const midis: number[] = [] // 与帧一一对应,0 = 无
+  for (let f = 0; f < n; f++) {
+    for (let i = 0; i < FRAME; i++) buf[i] = ds[f * HOP + i] || 0
+    const { freq, prob } = yin(buf, DS_SR, 0.15, 35, 220, scratch)
+    midis.push(prob > 0.6 ? 69 + 12 * Math.log2(freq / 440) : 0)
+  }
+  const frameT = (f: number) => (f * HOP + FRAME / 2) / DS_SR
+  const out: BassNote[] = []
+  let segStart = -1
+  let segMidis: number[] = []
+  const flush = (endF: number) => {
+    if (segMidis.length >= 3 && segStart >= 0) {
+      const s = segMidis.slice().sort((a, b) => a - b)
+      const med = s[s.length >> 1]
+      out.push({ start: frameT(segStart), end: frameT(endF), midi: Math.round(med) })
+    }
+    segStart = -1
+    segMidis = []
+  }
+  for (let f = 0; f < n; f++) {
+    const m = midis[f]
+    if (m <= 0) {
+      flush(f)
+      continue
+    }
+    if (segStart < 0) {
+      segStart = f
+      segMidis = [m]
+    } else {
+      const s = segMidis.slice().sort((a, b) => a - b)
+      const med = s[s.length >> 1]
+      if (Math.abs(m - med) <= 0.7) segMidis.push(m)
+      else {
+        flush(f)
+        segStart = f
+        segMidis = [m]
+      }
+    }
+  }
+  flush(n)
+  return out.filter((b) => b.end - b.start >= 0.1)
+}
+
+/**
+ * 鼓茎 BPM 提示:分离把打击乐单独拿出来之后,包络自相关跟的是纯节拍律动,
+ * 比在混音包络上估计可靠得多(BPM 八度错选的主要来源就是混音包络混入了旋律律动)。
+ *
+ * 包络用「起音强调」(半波整流的能量增量)而不是原始 RMS:HPSS 的打击乐掩码
+ * 会漏进吉他扫弦的稳态延音,RMS 包络被它拖到伪峰;攻击包络只看瞬态。
+ * 锁定度不足(混音分离不够干净时强度自然掉到噪声级)返回 null,调用方回退原逻辑——
+ * 宁可不给提示,不能给错提示。
+ */
+export function percussiveBpmHint(percussive: Float32Array[], sampleRate: number): number | null {
+  const len = percussive[0]?.length ?? 0
+  if (len === 0) return null
+  const HOP = 512
+  const n = Math.floor(len / HOP)
+  if (n < sampleRate / HOP) return null // 至少 1 秒
+  const rms = new Float32Array(n)
+  for (let f = 0; f < n; f++) {
+    let s = 0
+    for (const ch of percussive) {
+      for (let i = f * HOP; i < (f + 1) * HOP; i++) s += ch[i] * ch[i]
+    }
+    rms[f] = Math.sqrt(s / (HOP * percussive.length))
+  }
+  const atk = new Float32Array(n)
+  for (let f = 2; f < n; f++) atk[f] = Math.max(0, rms[f] - Math.max(rms[f - 1], rms[f - 2]))
+  const { bpm, strength } = estimateBpmFromEnvelope(atk, sampleRate / HOP)
+  return strength > 0.15 ? bpm : null
 }

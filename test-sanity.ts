@@ -139,5 +139,27 @@ check('音高正确 A4 B4 C5 D5', expect.every((m2, i) => res.notes[i]?.midi ===
   check('复音输入给出疑似复音标记(L7)', rc.likelyPolyphonic === true, `notes=${rc.notes.length}`)
 }
 
+// 9. 调弦音域回归:Drop D 的 D2(MIDI 38)既不能被 clamp 成 E2,也不能凭空冒出 E2
+//    旧实现硬编码 Math.max(40, Math.min(88, …)) —— Drop D/DADGAD/Open D/降半音全部报错音
+{
+  const srD = 22050
+  const hz = 73.42 // D2
+  const dur = 2.0
+  const sigD = new Float32Array(Math.floor(srD * dur))
+  for (let i = 0; i < sigD.length; i++) {
+    const t = i / srD
+    const env = Math.exp(-2.2 * t) * Math.min(1, t * 200)
+    sigD[i] = 0.6 * env * (Math.sin(2 * Math.PI * hz * t) + 0.5 * Math.sin(4 * Math.PI * hz * t) + 0.3 * Math.sin(6 * Math.PI * hz * t))
+  }
+  const rDrop = transcribe(sigD, srD, { lowestMidi: 38, highestMidi: 79 })
+  check('Drop D:D2 识别为 MIDI 38(不再被抬高到 40)', rDrop.notes.some((n) => n.midi === 38), rDrop.notes.map((n) => n.midi).join(','))
+  const rStd = transcribe(sigD, srD) // 默认音域 40..88
+  check(
+    '默认音域下 D2 被丢弃而不是改写成 E2',
+    !rStd.notes.some((n) => n.midi === 40),
+    rStd.notes.map((n) => n.midi).join(',') || '空',
+  )
+}
+
 console.log(failed === 0 ? '\n全部通过 ✓' : `\n${failed} 项失败 ✗`)
 process.exit(failed === 0 ? 0 : 1)

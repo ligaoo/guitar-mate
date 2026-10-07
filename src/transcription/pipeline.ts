@@ -1,6 +1,7 @@
 // 自动扒谱 DSP 管线:重采样 → STFT → 频谱通量起音检测 → YIN 逐帧音高 → 音符分割 → BPM 估计 → 量化
 // 设计为在 Web Worker 中运行,适合单旋律/单音吉他片段(复音失真段落准确率有限)
 import { yin, makeYinScratch } from '../audio/pitch'
+import { estimateTuningFromF0 } from './tuning'
 
 export const SR = 22050
 
@@ -21,6 +22,9 @@ export interface TranscribeResult {
   f0Track: Float32Array // 每 hop 一帧的 f0(0=无),供 UI 画音高轨迹
   likelyPolyphonic?: boolean // DSP 路径的复音疑似标记(建议切换 Basic Pitch)
   bpmStrength?: number // 节拍锁定度 0-1(包络自相关峰值归一化),高=可信
+  tuningCents?: number // 全曲音准校准检测到的整体偏移(音分),未检测/不适用为 undefined
+  /** 起音对时实际移动的音符数(BP 路径;0/undefined = 未启用或无需移动) */
+  retimed?: number
 }
 
 export function toMono(channels: Float32Array[], length: number): Float32Array {
@@ -225,7 +229,15 @@ function median(arr: number[]): number {
   return s[Math.floor(s.length / 2)]
 }
 
-function segmentNotes(onsets: number[], f0: Float32Array, rms: Float32Array, duration: number): RawNote[] {
+function segmentNotes(
+  onsets: number[],
+  f0: Float32Array,
+  rms: Float32Array,
+  duration: number,
+  tuningSemis = 0,
+  lo = 40,
+  hi = 88,
+): RawNote[] {
   const notes: RawNote[] = []
   const bounds = [...onsets, duration]
   for (let i = 0; i < bounds.length - 1; i++) {
@@ -240,7 +252,7 @@ function segmentNotes(onsets: number[], f0: Float32Array, rms: Float32Array, dur
     }
     if (midis.length < 2) continue
     const med = median(midis)
-    const rounded = Math.round(med)
+    const rounded = Math.round(med - tuningSemis) // 扣除整体音准偏移后再取整
     const inliers = midis.filter((m) => Math.abs(m - rounded) <= 0.7)
     const conf = inliers.length / midis.length
     if (conf < 0.5) continue
@@ -261,12 +273,14 @@ function segmentNotes(onsets: number[], f0: Float32Array, rms: Float32Array, dur
     notes.push({
       start,
       end,
-      midi: Math.max(40, Math.min(88, rounded)),
+      midi: rounded,
       confidence: Math.min(1, conf),
       velocity: Math.min(1, vel * 3.5),
     })
   }
-  return notes
+  // 音域过滤放在最后:超出当前调弦+最高品的音是"弹不出来"而不是"换成别的音",
+  // 绝不能 clamp(旧实现 Math.max(40,…) 会把 Drop D 的 D2=38 变成 E2=40,属于报错音)
+  return notes.filter((n) => n.midi >= lo && n.midi <= hi)
 }
 
 /** 无明显起音(连奏)时的兜底:按音高连续性分段。
@@ -276,7 +290,7 @@ export function segmentByPitchProbe(f0: Float32Array, rms: Float32Array): RawNot
   return segmentByPitch(f0, rms)
 }
 
-function segmentByPitch(f0: Float32Array, rms: Float32Array): RawNote[] {
+function segmentByPitch(f0: Float32Array, rms: Float32Array, tuningSemis = 0, lo = 40, hi = 88): RawNote[] {
   interface Seg {
     start: number
     end: number
@@ -320,10 +334,11 @@ function segmentByPitch(f0: Float32Array, rms: Float32Array): RawNote[] {
     .map((s) => ({
       start: s.start,
       end: s.end,
-      midi: Math.max(40, Math.min(88, Math.round(median(s.midis)))),
+      midi: Math.round(median(s.midis) - tuningSemis),
       confidence: 0.55,
       velocity: 0.6,
     }))
+    .filter((n) => n.midi >= lo && n.midi <= hi)
 }
 
 // ---- BPM 估计与量化 ----
@@ -445,8 +460,201 @@ export function estimateBpmFromEnvelope(env: Float32Array, fps: number): { bpm: 
   return { bpm: Math.max(30, Math.min(300, Math.round(bpm))), strength: Math.max(0, Math.min(1, sm[lag] / (varr / n))) }
 }
 
-/** 主入口:完整管线 */
-export function transcribe(monoData: Float32Array, srIn: number): TranscribeResult {  const resampled = normalize(resampleLinear(monoData, srIn, SR))
+/** 用「音符起点 + 响度」给一个 BPM 候选打分:0 = 完全不贴合,1 = 完美。
+ *
+ *  为什么需要它(ACCURACY.md §9.5):包络自相关在"吉他只弹八分音符/分解和弦"的素材上
+ *  会锁到错误的周期(合成混音 7 个样例里 4 个把 100 BPM 读成 164/50/165/164),
+ *  而 BPM 直接决定谱面网格 —— 认对了音也会整谱错位。音符级 F1 55.5% 却只有 34.7% 的谱面 F1,
+ *  差额主要在这里。
+ *
+ *  两项证据:
+ *   · **格内贴合**(权重 0.6):所有音符离最近格线的偏差 —— 纯残差不足以区分整倍速
+ *     (100 与 200 都能让八分音符落在整数格上),所以要有第二项;
+ *   · **重音对比**(权重 0.4):拍点上的平均响度 vs 反拍上的平均响度。
+ *     注意不能用"圆周集中度"—— 双倍速会让所有音都变成正拍、集中度饱和,反而奖励错误答案;
+ *     对比度对整倍速是自惩罚的(把反拍也算成拍点,对比度自然减半),
+ *     而"没有反拍音"时返回中性 0.5,不构成证据。
+ *
+ *  @param notes 音符(需 start;confidence 作为响度权重,缺省 1)
+ *  @param bpm 候选速度
+ *  @param subdiv 每拍细分(与量化网格一致,默认 12) */
+export function scoreBpmCandidate(
+  notes: { start: number; confidence?: number }[],
+  bpm: number,
+  subdiv = 12,
+): { score: number; gridFit: number; accent: number } {
+  const empty = { score: 0, gridFit: 0, accent: 0.5 }
+  if (notes.length < 4 || bpm <= 0) return empty
+  const beat = 60 / bpm
+  const grid = beat / subdiv
+  const t0 = notes.reduce((m, n) => Math.min(m, n.start), Infinity)
+  let wSum = 0
+  let fitSum = 0
+  // 拍点 / 反拍两侧的响度累加(相位在四分之一拍内的算拍点)
+  let beatAmp = 0
+  let beatW = 0
+  let offAmp = 0
+  let offW = 0
+  for (const n of notes) {
+    const w = Math.max(0.05, n.confidence ?? 1)
+    // 格内贴合:偏差折到 [0,0.5] 后线性映射到 [0,1]
+    const r = (n.start - t0) / grid
+    const d = Math.abs(r - Math.round(r))
+    fitSum += w * (1 - 2 * Math.min(0.5, d))
+    // 拍内相位 ∈ [0,1)
+    const ph = (((n.start - t0) / beat) % 1 + 1) % 1
+    const distBeat = Math.min(ph, 1 - ph) // 到正拍的距离
+    if (distBeat <= 0.25) {
+      beatAmp += w
+      beatW += w
+    } else if (Math.abs(ph - 0.5) <= 0.25) {
+      offAmp += w
+      offW += w
+    }
+    wSum += w
+  }
+  if (wSum <= 0) return empty
+  const gridFit = fitSum / wSum
+  let accent = 0.5
+  if (beatW > 0 && offW > 0) {
+    const b = beatAmp / beatW
+    const o = offAmp / offW
+    accent = ((b - o) / Math.max(1e-6, b + o)) * 0.5 + 0.5
+  }
+  return { score: 0.6 * gridFit + 0.4 * accent, gridFit, accent }
+}
+
+export interface BpmArbitration {
+  bpm: number
+  /** 采用结果的格内贴合度(0-1):可当作"音符是否按格演奏"的可信度,语义接近旧的 bpmStrength */
+  strength: number
+  /** 是否改写了传入的估计值(用于 UI 提示与回归断言) */
+  overridden: boolean
+  /** 采用的候选来自哪里 */
+  source: 'current' | 'grid' | 'grid-octave' | 'hint'
+}
+
+/**
+ * BPM 仲裁:在"包络/直方图给的初估"与"音符网格自己找到的最优速度"之间做保守选择。
+ *
+ * 策略刻意保守(真实数据上初估已有 7/8 正确,不能为了修混音把对的改错):
+ *   ① 先算初估与全局最优(粗扫 + 局部细化)的贴合分;
+ *   ② 若全局最优与初估成 2×/½× 关系且分差 < 0.15 → **保持初估**(避免倍频误改);
+ *   ③ 否则只有分差 > 0.08(明确更优)才改写;
+ *   ④ 有鼓轨提示时:改写后的结果若与提示成 2×/½×,以提示为准。
+ */
+export function arbitrateBpm(
+  current: number,
+  notes: { start: number; confidence?: number }[],
+  opts: { hint?: number; subdiv?: number; lo?: number; hi?: number } = {},
+): BpmArbitration {
+  const subdiv = opts.subdiv ?? 12
+  const lo = opts.lo ?? 45
+  const hi = opts.hi ?? 220
+  const hint = opts.hint && opts.hint > 0 ? opts.hint : 0
+  const empty: BpmArbitration = { bpm: current, strength: 0, overridden: false, source: 'current' }
+  if (notes.length < 6 || current <= 0) {
+    return { bpm: hint || current, strength: 0, overridden: false, source: hint ? 'hint' : 'current' }
+  }
+  const cur = scoreBpmCandidate(notes, current, subdiv)
+  // 速度先验:120 BPM 为中心的对数高斯(±0.5 八度)。整倍速在"只有八分音符"的素材上
+  // 证据完全相同(网格都贴合、都没有反拍),只能靠先验裁决 —— 这也正是包络估计器里
+  // 90-180 先验在做的事,这里用平滑版本避免硬边界。
+  const prior = (b: number) => 0.12 * Math.exp(-((Math.log2(b / 120) ** 2) / (2 * 0.25)))
+  let bestBpm = current
+  let bestTotal = -1
+  let bestEv = cur
+  for (let b = lo; b <= hi; b += 1) {
+    const ev = scoreBpmCandidate(notes, b, subdiv)
+    const t = ev.score + prior(b)
+    if (t > bestTotal) {
+      bestTotal = t
+      bestBpm = b
+      bestEv = ev
+    }
+  }
+  for (let b = Math.max(lo, bestBpm - 1); b <= Math.min(hi, bestBpm + 1); b += 0.1) {
+    const ev = scoreBpmCandidate(notes, b, subdiv)
+    const t = ev.score + prior(b)
+    if (t > bestTotal) {
+      bestTotal = t
+      bestBpm = b
+      bestEv = ev
+    }
+  }
+  const curTotal = cur.score + prior(current)
+  if (bestTotal < 0) return empty
+  const ratio = bestBpm / current
+  const isOctave = Math.abs(ratio - 2) <= 0.06 || Math.abs(ratio - 0.5) <= 0.06
+  let chosen = current
+  let source: BpmArbitration['source'] = 'current'
+  // 绝对门槛:候选自身必须真的解释得了这些音符(噪声素材上总会有一个"相对更好"的速度)
+  const credible = bestEv.score >= 0.66 && bestEv.gridFit >= 0.7
+  if (!credible) {
+    chosen = current
+  } else if (isOctave) {
+    // ② 倍频关系:证据本身分不出胜负(整倍速网格同样贴合),由先验裁决;
+    //    先验优势很小(0.03)就足以改写,但要真正有优势才动
+    if (bestTotal - curTotal > 0.03) {
+      chosen = bestBpm
+      source = 'grid-octave'
+    }
+  } else if (bestTotal - curTotal > 0.08) {
+    // ③ 非倍频关系(说明初估周期本身就锁错了)→ 只在明确更优时改写
+    chosen = bestBpm
+    source = 'grid'
+  }
+  // ④ 鼓轨提示仲裁:与提示成 2×/½× → 以提示为准;已经与提示一致 → 记为提示来源(便于诊断)
+  if (hint > 0) {
+    const r = chosen / hint
+    if (Math.abs(r - 2) <= 0.08 || Math.abs(r - 0.5) <= 0.08) {
+      chosen = hint
+      source = 'hint'
+    } else if (Math.abs(chosen - hint) <= hint * 0.04) {
+      source = 'hint'
+    }
+  }
+  const rounded = Math.max(30, Math.min(300, Math.round(chosen)))
+  return {
+    bpm: rounded,
+    strength: Math.max(0, Math.min(1, scoreBpmCandidate(notes, rounded, subdiv).gridFit)),
+    overridden: rounded !== Math.round(current),
+    source,
+  }
+}
+
+export interface TranscribeOptions {
+  /** 分离出的鼓轨上估计的 BPM(比混音包络可靠):自身包络锁定不住时采用 */
+  bpmHint?: number
+  /** MIDI 音域下限(默认 40 = 标准调弦 E2)。Drop D/DADGAD/Open D 要传 38,
+   *  降半音传 39 —— 否则低音弦会被当成"另一个音"或直接丢掉 */
+  lowestMidi?: number
+  /** MIDI 音域上限(默认 88):按当前调弦 + 最高品传入(如标准调弦 15 品 → 79) */
+  highestMidi?: number
+}
+
+/** 起音检测的完整产物(复用于 BP 路径的时间基准) */
+export interface OnsetAnalysis {
+  /** 起音时间(秒,绝对时间轴;已扣除前置补零造成的坐标偏移) */
+  onsets: number[]
+  /** 归一化 + 重采样到 SR 的单声道音频(BP 路径复用,避免二次重采样) */
+  resampled: Float32Array
+  /** 前置补零后的信号(DSP 内部的 f0/能量帧索引基于它) */
+  padded: Float32Array
+  /** 逐帧 RMS(基于 padded) */
+  rms: Float32Array
+  duration: number
+}
+
+/**
+ * 起音检测(重采样 → 峰值归一 → 补零 → STFT → 频谱通量 + 自适应阈值)。
+ *
+ * 单独导出有两个用途:① `transcribe()` 内部使用;② 给 Basic Pitch 做时间基准 ——
+ * BP 的起音是 86fps 帧量化(11.6ms,占 12 细分格宽的 22~38%),而本检测器实测
+ * 与标注的有符号偏差中位数 ≤3.4ms,用它给 BP 的音符起点对时可以显著改善量化准确率。
+ */
+export function analyzeOnsets(monoData: Float32Array, srIn: number): OnsetAnalysis {
+  const resampled = normalize(resampleLinear(monoData, srIn, SR))
   const duration = resampled.length / SR
   // 前置补零:保证信号开头的起音有"静音 → 发声"的对比帧可检
   const padded = new Float32Array(WIN + resampled.length)
@@ -464,11 +672,28 @@ export function transcribe(monoData: Float32Array, srIn: number): TranscribeResu
   if (firstSound >= 0 && (onsets.length === 0 || onsets[0] - firstSound > 0.12)) {
     onsets = [Math.max(0, firstSound), ...onsets]
   }
+  return { onsets, resampled, padded, rms, duration }
+}
+
+/** 只要起音时间(秒)。与 `transcribe()` 走完全相同的检测链路与坐标校正。 */
+export function estimateOnsets(monoData: Float32Array, srIn: number): number[] {
+  return analyzeOnsets(monoData, srIn).onsets
+}
+
+/** 主入口:完整管线 */
+export function transcribe(monoData: Float32Array, srIn: number, opts: TranscribeOptions = {}): TranscribeResult {
+  const lo = opts.lowestMidi ?? 40
+  const hi = opts.highestMidi ?? 88
+  const { padded, rms, duration, onsets: rawOnsets } = analyzeOnsets(monoData, srIn)
+  let onsets = rawOnsets
   const f0 = trackF0(padded)
+  // 全曲音准校准:估计整体偏移,音符取整前统一扣除(±50 音分内的系统性半音错音由此消除)
+  const tune = estimateTuningFromF0(f0)
+  const tuningSemis = tune ? tune.semis : 0
   // 同音伪起音合并(需先有 f0)
   onsets = suppressSamePitchOnsets(onsets, f0, duration)
-  let notes = onsets.length >= 2 ? segmentNotes(onsets, f0, rms, duration) : []
-  if (notes.length === 0) notes = segmentByPitch(f0, rms)
+  let notes = onsets.length >= 2 ? segmentNotes(onsets, f0, rms, duration, tuningSemis, lo, hi) : []
+  if (notes.length === 0) notes = segmentByPitch(f0, rms, tuningSemis, lo, hi)
   // 复音疑似检测:有能量的帧里 YIN 检出稳定单音的比例过低(和弦/双音会让 YIN 失效)
   let energyFrames = 0
   let voicedEnergyFrames = 0
@@ -489,7 +714,23 @@ export function transcribe(monoData: Float32Array, srIn: number): TranscribeResu
       merged.push({ ...n })
     }
   }
-  const { bpm } = estimateBpm(onsets.length >= 2 ? onsets : merged.map((n) => n.start))
+  // BPM:能量包络自相关优先(跟全曲律动);再用"音符网格贴合 + 重音落拍"做保守仲裁,
+  // 修正包络在"只弹八分/分解和弦"素材上锁错周期的问题(ACCURACY.md §9.5)
+  const envBpm = estimateBpmFromEnvelope(rms, SR / HOP)
+  const guessed =
+    envBpm.strength > 0.1 ? envBpm.bpm : opts.bpmHint && opts.bpmHint > 0 ? opts.bpmHint : estimateBpm(onsets.length >= 2 ? onsets : merged.map((n) => n.start)).bpm
+  const arb = arbitrateBpm(guessed, merged, { hint: opts.bpmHint })
+  const bpm = arb.bpm
   const offset = onsets.length > 0 ? onsets[0] : merged.length > 0 ? merged[0].start : 0
-  return { notes: merged, onsets, bpm, offset, duration, f0Track: f0, likelyPolyphonic }
+  return {
+    notes: merged,
+    onsets,
+    bpm,
+    offset,
+    duration,
+    f0Track: f0,
+    likelyPolyphonic,
+    bpmStrength: arb.strength > 0 ? Math.max(arb.strength, envBpm.strength) : envBpm.strength,
+    tuningCents: tune ? Math.round(tune.semis * 100) : undefined,
+  }
 }

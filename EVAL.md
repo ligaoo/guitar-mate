@@ -8,6 +8,12 @@
 > node scripts/eval-transcription.mjs --list          # 列出样例
 > node scripts/eval-transcription.mjs --engine=bp --variant=oracle --json=eval/r.json
 > ```
+>
+> **⚠ 2026-10-05 重要更新(第三轮,见 §10)**:本文件 §2~§8 的数字是**旧默认参数**下的留档,
+> 其中「量化谱面 F1」用的是**真值 BPM + 真值锚点**,是识别能力的上界,**不等于用户看到的谱面**。
+> 第三轮把量化/指法链路接进了评测(`--pipeline=product`,默认开),并落地了一批修复:
+> 真实 8 片段上 音符级 64.4% → **72.8%**、产品谱面 28.1% → **57.5%**。
+> 新留档:`eval/bp-real-v3.json`、`eval/bp-report-v3.json`。**以 §10 为准。**
 
 ---
 
@@ -33,12 +39,28 @@
 ### 1.2 指标
 
 主指标是 MIREX 风格的音符级匹配:**起音落在 ±50ms 内且音高完全相等**才算命中。
+**匹配算法为最大基数二分匹配**(Kuhn 增广路径,2026-10-07 替换按距离贪心——贪心在
+±50ms 窗内挤着多个同音高候选的和弦密集处会系统性低估命中数)。
 
-另外给出两个诊断指标,用于把误差归因到音高还是节奏:
+另外给出诊断指标,用于把误差归因到音高还是节奏(2026-10-07 按 PLAN-90 阶段 1 扩充):
 
-- `pitchOnlyF1` — 只看音高(多重集交集),忽略时间对齐
 - `onsetOnlyF1` — 只看时间,忽略音高
+- `onsetOffsetF1` — COnPOnOff:起音+音高命中且音尾偏差 ≤ max(0.12s, 25% ref 时值)
+- `octaveTolF1` — 音高差 ±12/24 也计命中(八度误配的代价量化)
+- `chromaF1` — 忽略八度(音级相同即命中)
+- `pitchOnlyF1` — 只看音高(多重集交集),忽略时间对齐
+- `strictF1` — ±25ms 严格容差(帧量化/检测延迟在这里暴露)
 - `octaveErrors` — 时间对上了但差 12/24 半音(贝斯谐波、八度重影的典型症状)
+
+**每个指标都必须与随机基线并列读**(`shiftNotes(est, 1.37)` 整体错开后再算同一指标):
+没有基线列的百分比不可解读——实测把参考谱整体错开 1.37s(完全对不上)后,
+「逐音音频验证率」仍有 70.4%,而 exact F1 基线仅 2.4%(《God knows》实测,
+`eval/ref-compare-godknows.json`)。
+
+**分数级指标(尺子 B)**:`scoreTabCells` 把双方量化到网格后按「格×弦×品」/「小节×弦×品」
+比对——用户感知的准确率(对 ±50ms 抖动不敏感,直接对应改谱成本);REF 模式在该口径
+按构造 ≈100%。与 `scoreProduct`(格+音高)互补:同音高换弦位在分数级判错,
+这正是六线谱产品的"对错"。
 
 ### 1.3 为什么先用合成样例
 
@@ -170,18 +192,161 @@ MIDI 音域过滤原为硬编码 `midi >= 40 && midi <= 88`(E2–E6),
 
 ## 5. 下一步(按性价比排序)
 
-1. **接入真实标注音频**(最高优先)。当前样例集是合成的,绝对分数不能外推。
-   做法:`EvalClip` 增加可选的 `audio` 字段(音频路径 + 采样率),存在时跳过渲染、
-   直接读取音频;标注格式不变。数据源可用 GuitarSet(带弦/品标注的独奏吉他录音)。
-2. **吉他专用模型 / 微调**。§3.3 已经证明召回率瓶颈在模型侧,不在分离侧。
-   文献方向是用 GuitarSet 微调 Basic Pitch 的输出头,或直接上 FretNet 这类
-   **直接预测弦+品**的模型(通用模型的输出只有音高,弦/品只能靠 DP 猜)。
-3. **全曲音准校准**(§4.5 第一条)。成本低、收益确定。
+1. ~~接入真实标注音频~~ → **已完成,见 §8**。真实基线已建立,并修正了"必须训练"的判断。
+2. **先比现成模型,再谈训练**(优先级因 §8.2 上调)。用 §8.3 的外部引擎链路把
+   MT3 拉进同一张表:若 MT3 的和弦召回显著超过 Basic Pitch,直接换/并联模型,
+   训练环节跳过;仍不够时再启动 GuitarSet 微调(脚本 + Colab 流程,小时级)。
+3. ~~全曲音准校准~~ → **已完成,见 §7.2**;真实数据上全片段触发(§8.2)。
 4. **换用学习型分离后端**。`SeparationBackend` 接口已就位;离线 DSP 后端的硬限制是
-   **无法把「居中的人声」和「居中的吉他」分开**——`guitar-vocal` 样例上 oracle 也只有 31.2%,
-   说明单靠频段与空间信息不够,需要 Demucs/htdemucs 级模型。
-5. **BPM / 节拍跟踪**(§4.5 第二条)。理想做法是在**鼓轨**上做 beat tracking(分离已经
-   把鼓轨单独拿出来了),并把「单一 BPM」升级为「分段 BPM / beat 序列」。
+   **无法把「居中的人声」和「居中的吉他」分开**。注意 §8.2:分离对干净录音是净伤害,
+   模型后端的目标是"混音场景",不是"所有场景"。
+5. **BPM / 节拍跟踪**:鼓轨提示已接入(§7.4);真实独奏录音上包络 BPM 已 15/16 判对
+   (§8.1),剩余问题是混音场景与分段 BPM。
+
+---
+
+## 7. 第二轮优化(2026-09-29,阶段 0+1 落地)
+
+按「先度量后优化」的顺序,本轮完成了评测基础设施(阶段 0)与四项低成本优化(阶段 1)。
+结果留档:`eval/bp-report-v2.json`、`eval/dsp-report-v2.json`。
+
+### 7.1 评测基础设施(阶段 0)
+
+- **指标扩展**([metrics.ts](scripts/eval/metrics.ts)):`strictF1`(±25ms 严格档)、
+  `onsetOffsetF1`(COnPOnOff 风格,含音尾考核)、`scoreQuantized`(量化到 BPM 网格后的
+  谱面 F1——用户最终看到的东西)、`judgeBpm`(±4% 内对 / 恰为半倍速算八度错 / 其余错)。
+  报表与 JSON 均已带这些列。
+- **真实音频样例**:`EvalClip.audio`(WAV 路径 + 声道)存在时跳过渲染直接解码
+  ([wav.ts](scripts/eval/wav.ts),无依赖,支持 16/24/32 位整数与 32/64 位浮点)。
+  **接 GuitarSet 只差数据文件与标注转换脚本。**
+- **冒烟测试**:`test-eval-smoke.ts` 进 `npm test`(WAV 往返、指标语义、
+  solo-guitar DSP F1 ≥ 0.9、复音标记),秒级守护「随时可评」。
+- 新增样例 `full-mix-detune25`(整体 +25 音分,常见调音偏差区间)。
+
+### 7.2 全曲音准校准(阶段 1.1)
+
+- 实现:[tuning.ts](src/transcription/tuning.ts)。YIN f0 → 偏差直方图峰(5 音分桶)
+  → 门控(support ≥ 0.55 且 |偏移| ≥ 2 音分)→ 统一校正。
+- DSP 路径:音符取整前扣除偏移;BP 路径:帧矩阵分数半音移位(`shiftFramesPitch`,
+  音高域移调,时间轴不动,不重推理)。
+- **两次踩坑(都有数字为证)**:
+  1. BP 的帧激活是**分类器输出,会向半音格收缩**——+25¢ 的样例在帧质心上只读出
+     +2~3¢,而 55¢ 样例读出 -23/-7/+27 的噪声值,错误的部分修正曾让 sharp 样例
+     12.4% → 8.1%。改为 **YIN 物理测量**(`estimateTuningFromPcm`)后解决。
+  2. 混音上 YIN 被多声部拉散,support ≤ 0.45,而干净输入 ≥ 0.7——按此分层把门控
+     从 0.4 提到 0.55,混音上的噪声读数被拒绝而不是被错误应用(full-mix raw 曾因此
+     30.8% → 24.9%,修复后回到 30.8%)。
+- **效果**(BP):solo-guitar raw **99.1% → 100.0%**(校正了渲染音频 +12¢ 的系统偏置);
+  `full-mix-detune25` sep-c **31.3% → 35.5%**(检测 +23¢),追平不跑调的 full-mix(35.8%)。
+- **边界**:偏移按 ±50 音分假设估计。超出后(如 55¢ 样例)在声学上等价于
+  「低半音演奏 + 整体调高」,无绝对参考不可分辨——原理性盲区,样例留档说明。
+
+### 7.3 和弦词典 snap 与贝斯幽灵修剪(阶段 1.3/1.4)
+
+- `snapClustersToChords`([cleanup.ts](src/transcription/cleanup.ts)):60ms 同时发音簇
+  (3~6 音)不在任何和弦音级集合内时,尝试恰好一个音 ±1 半音修复(先精确匹配、再子集,
+  禁止音级塌缩)。合成样例上净中性(错音场景在合成数据里罕见),真实录音的
+  分布外噪声更常见此类错法,**默认开启**,`chordSnap: false` 可关。
+- `pruneBassHarmonicGhosts`([basicPitch.ts](src/transcription/basicPitch.ts)):与
+  亚吉他音域贝斯参照同帧起音、成 ±12/24 关系、双重置信度门槛(中位以下且 <0.35)的
+  幽灵音修剪。第一版在独奏样例上误删 40% 真实音符(贝斯茎被吉他低音弦污染),
+  加「参照必须低于吉他音域」防线后安全,但合成样例上净收益 ≈ 0
+  (合成渲染把吉他和贝斯精确对齐网格,真双打与幽灵不可区分)——
+  **默认关闭**(`bassGhostPrune: true` 开启),待真实数据评测再定。
+
+### 7.4 鼓轨 BPM 提示(阶段 1.2)
+
+- `percussiveBpmHint`([separation.ts](src/transcription/separation.ts)):在分离出的
+  鼓茎上用**起音强调包络**(半波整流的能量增量,稳态延音消失)做自相关。
+  普通 RMS 包络会被漏进的吉他延音拖到伪峰(full-mix 上曾读出 136 BPM)。
+- 仲裁策略:引擎自估 BPM 与鼓轨提示恰成 2×/½× 时,信鼓轨。
+- 效果:分离干净时(guitar-drums)50→100✓;鼓茎被污染时强度自然掉到噪声级、
+  返回 null **弃权而不是给错提示**(full-mix 仍 164✗,需学习型分离后才有解)。
+- 产品侧:`separateBuffer` 返回 `bpmHint`/`bassNotes`,扒谱页自动传给两个引擎;
+  分离提示行会显示「鼓轨节拍 NNN BPM」。
+
+### 7.5 第二轮结果总表(Basic Pitch,逐样例 F1)
+
+| 样例 | raw(基线→本轮) | sep-c(基线→本轮) | 备注 |
+|---|---|---|---|
+| solo-guitar | 99.1 → **100.0** | 97.3 → 97.3 | 调音 +12¢ 校正生效 |
+| guitar-drums | 31.4 → 31.4 | 28.6 → 28.6 | BPM 50→100✓(鼓轨提示) |
+| guitar-bass | 40.3 → 39.4 | 36.4 → 36.1 | 持平(±0.5 内) |
+| guitar-vocal | 42.1 → 42.1 | 43.0 → 43.0 | 持平 |
+| full-mix | 30.8 → 30.8 | 35.8 → 35.8 | 持平(混音上校准正确弃权) |
+| full-mix-detune25(新) | 23.7 | 31.3 → **35.5** | 调音 +23¢ 校正生效,追平 full-mix |
+| full-mix-sharp | 12.4 → 11.2 | 21.7 → 19.3 | >±50¢ 原理性盲区(§7.2) |
+
+DSP 引擎:solo-guitar sep **100.0%**。宏观无回归;新增 detune25 样例按预期受益。
+
+### 7.6 本轮结论
+
+1. **音准校准兑现了设计目标**:有效范围(±50¢)内完全恢复,范围外可解释地失效;
+   页面会显示检测到的偏移量。
+2. **「先度量后优化」抓到了两个险些上线的错误**:帧质心估音准(分类器收缩)和
+   无门控的贝斯修剪(独奏误删 40%)——都被评测在合入前拦截。
+3. 合成样例对「修剪类」优化的区分度不足(精确对齐网格),**真实数据评测(§5.1)
+   的优先级因此更高了**:贝斯修剪默认开关的最终决定应基于真实数据。
+4. 混音场景的两大瓶颈(和弦召回 19.3%、居中人声分离)未变,出路仍是 §5.2/§5.4
+   的模型侧与学习型分离。
+
+---
+
+## 8. 真实数据基线(GuitarSet,2026-09-29)
+
+> §5.1 的落地:8 个 GuitarSet 真实录音片段(4 solo 单音即兴 + 4 comp 和弦伴奏,
+> 覆盖 BN1/BN2/BN3/Funk1 四种风格、97~166 BPM),麦克风单声道 44.1kHz。
+> 留档:`eval/bp-real.json`、`eval/dsp-real.json`;复现步骤见 §8.3。
+
+### 8.1 结果(Basic Pitch)
+
+| 样例 | 标注 | raw F1 | raw 召回 | sep F1 | BPM | 调音 |
+|---|---|---|---|---|---|---|
+| BN1-129 comp | 133 | 60.5% | 48.9% | 57.7% | 129✓ | +13¢ |
+| BN1-147 solo | 89 | **77.8%** | 73.0% | **79.2%** | 146✓ | +21¢ |
+| BN2-131 comp | 239 | 49.0% | 36.8% | 44.5% | 130✓ | +17¢ |
+| BN2-166 solo | 87 | **77.8%** | 74.7% | **81.0%** | 165✓ | +8¢ |
+| BN3-119 comp | 169 | **69.1%** | 56.8% | 65.2% | 119✓ | +12¢ |
+| BN3-154 solo | 101 | 63.7% | 57.4% | 60.2% | 155✓ | +17¢ |
+| Funk1-114 comp | 307 | 46.5% | 33.2% | 42.2% | 152✗ | +8¢ |
+| Funk1-97 solo | 62 | 70.6% | 77.4% | 69.6% | 96✓ | +11¢ |
+| **均值** | | **64.4%** | **57.3%** | **62.5%** | 15/16✓ | 全部检出 |
+
+DSP 引擎:solo F1 30.8~73.5%(均值 ~55%),comp 8.5~24.5%——单音引擎的真实水平。
+
+### 8.2 三个改变判断的发现
+
+1. **「19.3% 和弦召回墙」部分是合成数据的悲观假象。** 真实录音上 comp 类召回
+   28~57%(均值 ~40%),比 Karplus-Strong 合成和弦的 19.3% 高一倍——真实吉他
+   音色在 Basic Pitch 的训练分布内。**合成样例的绝对分数确实不能外推(§1.3 的
+   警告被证实),此前"必须微调模型"的结论需要下调优先级**;先把 MT3 这类现成
+   更强模型拉进来比一比(§8.3),再决定是否值得训练。
+2. **真实吉他普遍偏尖 +8~+21¢,音准校准在全部 8 个片段上触发。** §7.2 的功能
+   在真实数据上是"每次都在工作"的状态,不是边角料。
+3. **分离对干净录音是净伤害**(所有 8 个片段 sep 均低于 raw)。HPSS 削拨弦瞬态
+   的代价(§3.4)在无伴奏录音上没有对冲收益——产品里「麦克风录音默认关」的
+   策略是对的;GuitarSet 这类独奏录音属于"干净导入",用户可手动关掉。
+
+### 8.3 复现与扩展
+
+```bash
+# 数据(Zenodo,共 ~700MB):注解 + 麦克风混音
+#   https://zenodo.org/record/3371780  annotation.zip + audio_mono-mic.zip
+node scripts/prepare-guitarset.mjs --dir=<数据目录> --limit=8   # → eval/real-clips.json(本地,不入库)
+npm run eval -- --real --engine=bp --variant=raw,sep --clip=gs- --json=eval/bp-real.json
+```
+
+**外部引擎对比(MT3 等,无需训练)**:
+
+```bash
+npm run eval -- --real --variant=raw --clip=gs- --export-wav=D:/music/eval-export  # 导出 WAV
+# → 上传 scripts/mt3/transcribe_colab.py + eval-export/ 到 Colab(GPU)运行 → 取回 mt3-out/
+npm run eval -- --real --engine=bp,ext --ext-dir=<mt3-out> --variant=raw --clip=gs-
+```
+
+约定:`<clipId>.<variant>.json` = `{notes: [{start, end, midi}], bpm?}`——任何外部
+转录器(微调后的 Basic Pitch、FretNet……)按此格式输出即可进同一张评测表。
+详见 [scripts/mt3/README.md](scripts/mt3/README.md)。
 
 ---
 
@@ -193,13 +358,83 @@ npm run eval -- --engine=dsp     # 只跑 DSP,约 45 秒
 npm run eval -- --clip=solo-guitar --engine=bp --variant=raw,oracle -v
 ```
 
-结果 JSON 默认写到 `eval/`(基线留档:`eval/bp-report.json`、`eval/bp-oracle.json`、
-`eval/dsp-report.json`)。
+结果 JSON 默认写到 `eval/`:
+- 第一轮基线留档:`eval/bp-report.json`、`eval/bp-oracle.json`、`eval/dsp-report.json`
+- 第二轮(阶段 0+1 优化后,见 §7)留档:`eval/bp-report-v2.json`、`eval/dsp-report-v2.json`
 
 评分与样例定义:
 
 - 指标与匹配算法:[scripts/eval/metrics.ts](scripts/eval/metrics.ts)
 - 样例集:[scripts/eval/fixtures.ts](scripts/eval/fixtures.ts)
 - 音频渲染(含人性化抖动/扫弦):[scripts/eval/render.ts](scripts/eval/render.ts)
+- WAV 读写(真实音频样例):[scripts/eval/wav.ts](scripts/eval/wav.ts)
 - 引擎适配(复用 src 里的真实实现):[scripts/eval/engines.ts](scripts/eval/engines.ts)
 - 编排与报表:[scripts/eval/main.ts](scripts/eval/main.ts)
+
+---
+
+## 10. 第三轮:产品链路口径 + 真实回归(2026-10-05)
+
+> 详细诊断与全部改动依据见 [ACCURACY.md](ACCURACY.md)。本节只记评测口径的变化与新的留档数字。
+
+### 10.1 口径修正:以前测的不是用户看到的东西
+
+| 旧口径 | 问题 | 新口径 |
+|---|---|---|
+| `quantF1 = scoreQuantized(truth, est, clip.bpm)` | 用**真值 BPM + 真值锚点**(`anchor = round(ref[0].start/step)*step`),是识别上界 | `谱面F1 = scoreProduct(...)`:引擎 BPM(必要时 `refineBpm`)→ 引擎锚点 → 12 细分吸格 → 复音上限 → **指法分配**,再与标注比「格序号 + 音高」,并给出弦/品一致率 |
+| `scoreTab` 无调用方(死代码) | 弦/品准确率从未被度量 | `scoreProduct` 内联报告 `tabExactRate`/`stringRate`/`fretRate`,写入 JSON |
+| 评测未传 `lowestMidi/highestMidi`(用 36..90) | 与产品口径(按调弦 + 最高品)不一致 | 按 `clip.tuning` + `MAX_FRET=15` 传入 |
+| 评测固定用旧默认参数(0.35/0.2/12 帧/melodia 开) | 与产品的预设脱节 | 按样例自动选预设(`presetForClip`:含非吉他轨 → 混音预设,否则独奏预设),`--preset=solo|mix` 可强制 |
+
+新增 CLI:`--pipeline=product|engine`(默认 product)。
+
+### 10.2 真实数据回归进 `npm test`
+
+`test-real-eval.ts`:取 `eval/real-clips.json` 中一个 solo 一个 comp 片段的**前 8 秒**,
+跑 BP 全链路 + 产品链路,断言 音符级 F1 ≥ 0.62、产品谱面 F1 ≥ 0.48。
+数据不在场(缺 `eval/real-clips.json` 或音频)时**跳过而不是失败**;`GM_SKIP_REAL=1` 可强制跳过。
+CI(`.github/workflows/deploy.yml`)现在会跑 `npm test`。
+
+数据集准备(相对路径可入库、跨机器复现):
+
+```bash
+node scripts/prepare-guitarset.mjs --dir=D:/music/guitarset-data --limit=40 --rel
+# 旧版分层键含速度/调号(每文件唯一)→ --limit=8 只会抽到同一个演奏者 gs-00_*;已修
+# 数据换位置时可设 GM_DATA_DIR,评测与回归会自动回退解析
+```
+
+### 10.3 第三轮留档数字(Basic Pitch)
+
+真实 GuitarSet 8 片段(`--real --engine=bp --variant=raw --clip=gs-`):
+
+| 指标 | 第二轮留档 `bp-real.json` | 第三轮 `bp-real-v3.json` |
+|---|---|---|
+| 音符级 F1 / P / R | 64.4 / 77.4 / 57.3 | **72.8 / 89.2 / 62.5** |
+| 量化 F1(真值 BPM/锚点) | 45.6 | **59.3** |
+| **谱面 F1(产品链路)** | 未度量(旧量化含「步进吸附」时为 28.1) | **57.5** |
+| 指法(弦/品)一致率 | 未度量 | 55.2 |
+| BPM 对/八度/错 | 7/0/1 | 7/0/1 |
+
+合成混音 7 样例(`--engine=bp --variant=raw`):
+
+| 指标 | `bp-report-v2.json` | `bp-report-v3.json` |
+|---|---|---|
+| 音符级 F1 / P / R | 39.8 / 46.7 / 37.3 | **55.5 / 73.6 / 47.1** |
+| 量化 F1 | 37.8 | **51.5** |
+| 谱面 F1(产品链路) | 未度量 | 34.7 |
+
+### 10.4 本文件已知的记述错误(第三轮核对)
+
+- §8.1 的「BPM 15/16✓」应为 **14/16**:`bp-real.json` 里 `Funk1-114 comp` 的 raw 与 sep 都判为 152✗。
+- §1.1 的样例表只列了 6 个,`fixtures.ts` 实际有 **7** 个(含 `full-mix-detune25`);§6 的「6 样例」同此。
+- §1.1「20.5 秒」只对 `solo-guitar` 成立(和弦类 19.3s、含鼓 20.3s)。
+- §8.2「覆盖不同演奏者」在旧 `prepare-guitarset.mjs` 下**没有实现**(8 个样例全是 `gs-00_*` 同一演奏者);已修脚本,重跑即可扩样。
+
+### 10.5 复现(第三轮)
+
+```bash
+npm test                                                                    # 含真实数据回归(数据在场时约 20~30s)
+npm run eval -- --real --engine=bp --variant=raw --clip=gs- --json=eval/bp-real-v3.json
+npm run eval -- --engine=bp --variant=raw --json=eval/bp-report-v3.json
+node scripts/prepare-guitarset.mjs --dir=D:/music/guitarset-data --limit=40 --rel  # 扩样后把 eval/real-clips.json 入库即可在 CI 复现
+```

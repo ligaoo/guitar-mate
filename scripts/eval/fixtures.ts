@@ -229,6 +229,12 @@ export const FIXTURES: EvalClip[] = [
     vocalTrack(),
     drumTrack(),
   ]),
+  clip('full-mix-detune25', 'full-mix 且整体偏高 25 音分(常见调音偏差)', [
+    ...guitarDouble(chordNotes),
+    bassTrack(),
+    vocalTrack(),
+    drumTrack(),
+  ], 25),
   clip('full-mix-sharp', 'full-mix 且整体偏高 55 音分(变速翻录)', [
     ...guitarDouble(chordNotes),
     bassTrack(),

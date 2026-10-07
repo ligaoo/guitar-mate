@@ -10,6 +10,8 @@ interface Props {
   totalSteps?: number
   selectedId?: number | null
   playheadStep?: number | null
+  /** 低于该置信度的音符渲染成"待核对"橙色(不传则不标) */
+  lowConfTh?: number
   onSelect?: (id: number | null) => void
   onSlotClick?: (step: number, string: number) => void
 }
@@ -28,6 +30,7 @@ export default function TabView({
   totalSteps,
   selectedId = null,
   playheadStep = null,
+  lowConfTh,
   onSelect,
   onSlotClick,
 }: Props) {
@@ -136,6 +139,10 @@ export default function TabView({
                     {sorted.map((n) => {
                       const y = sy(n.string)
                       const isSel = n.id === selectedId
+                      // 低置信度音符:橙色圈 + "待核对"语义,让用户先修最可疑的地方
+                      const low = !isSel && lowConfTh !== undefined && (n.conf ?? 1) < lowConfTh
+                      const ring = isSel ? '#f0b45c' : low ? '#e8825a' : '#4cc2a9'
+                      const textFill = isSel ? '#10141b' : low ? '#e8825a' : '#4cc2a9'
                       return (
                         <g
                           key={n.id}
@@ -146,8 +153,11 @@ export default function TabView({
                           }}
                         >
                           <rect x={x - 13} y={y - 10} width="26" height="20" fill="transparent" />
-                          <circle cx={x} cy={y} r="9.5" fill={isSel ? '#f0b45c' : '#10141b'} stroke={isSel ? '#f0b45c' : '#4cc2a9'} strokeWidth="1.6" />
-                          <text x={x} y={y + 4} textAnchor="middle" fill={isSel ? '#10141b' : '#4cc2a9'} fontSize="11" fontWeight="800">
+                          {low && (
+                            <circle cx={x} cy={y} r="12" fill="none" stroke="#e8825a" strokeWidth="0.8" strokeDasharray="2 2" opacity="0.75" />
+                          )}
+                          <circle cx={x} cy={y} r="9.5" fill={isSel || low ? (isSel ? '#f0b45c' : '#1b1210') : '#10141b'} stroke={ring} strokeWidth="1.6" />
+                          <text x={x} y={y + 4} textAnchor="middle" fill={isSel ? '#10141b' : textFill} fontSize="11" fontWeight="800">
                             {n.fret < 0 ? '?' : n.fret}
                           </text>
                         </g>

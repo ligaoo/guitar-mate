@@ -6,15 +6,20 @@
   "scripts": {
     "predev": "node scripts/copy-model.mjs && node scripts/gen-sw.mjs",
     "dev": "vite",
+    "typecheck": "tsc --noEmit -p tsconfig.check.json",
     "prebuild": "node scripts/copy-model.mjs && node scripts/gen-sw.mjs",
-    "build": "tsc --noEmit && vite build",
+    "build": "npm run typecheck && vite build",
     "preview": "vite preview",
     "host": "npm run build && vite preview --host --port 4173",
     "serve:subpath": "node scripts/serve-subpath.mjs",
     "icons": "node scripts/gen-icons.mjs",
-    "test": "node scripts/run-tests.mjs",
+    "test": "npm run typecheck && node scripts/run-tests.mjs",
     "eval": "node scripts/eval-transcription.mjs",
-    "eval:bp": "node scripts/eval-transcription.mjs --engine=bp"
+    "eval:bp": "node scripts/eval-transcription.mjs --engine=bp",
+    "transcribe": "node scripts/run-transcribe.mjs",
+    "auto": "node scripts/run-auto.mjs",
+    "calibrate": "node scripts/run-calibrate.mjs",
+    "sweep": "node scripts/run-sweep.mjs"
   },
   "dependencies": {
     "@spotify/basic-pitch": "^1.0.1",

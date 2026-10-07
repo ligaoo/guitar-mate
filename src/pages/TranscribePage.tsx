@@ -1,31 +1,37 @@
 // 自动扒谱页:导入/录音 → 识别(DSP 或 Basic Pitch)→ 量化/指法 → 六线谱编辑 → 试听 → 导出/曲库
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { MicRecorder, decodeFile } from '../audio/recorder'
-import type { TranscribeResult } from '../transcription/pipeline'
+import { toMono, resampleLinear, SR, type TranscribeResult } from '../transcription/pipeline'
 import { assignFingering, type TabNote, type DroppedNote } from '../transcription/fingering'
 import { tabToText, tabToMidi, downloadBlob } from '../transcription/exporters'
-import { transcribeWithBasicPitch } from '../transcription/basicPitch'
-import { detectKey, filterToKey, capPolyphony, type KeyGuess } from '../transcription/cleanup'
+import { bpPreset, transcribeWithBasicPitch, type BpPresetId } from '../transcription/basicPitch'
+import { detectKey, type KeyGuess } from '../transcription/cleanup'
+import { refineBpm, quantizeNotes, SUBDIV, DUR_CYCLE } from '../transcription/quantize'
 import { separateBuffer } from '../transcription/preprocess'
+import { distortionIndex, DISTORTION_ROUTE } from '../transcription/auto/plan'
 import TabView from '../components/TabView'
 import { GuitarSynth } from '../audio/synth'
 import { getCtx, getMaster } from '../audio/engine'
 import { TUNINGS, STANDARD_TUNING } from '../theory/tunings'
-import { loadSongs, saveSong, deleteSong, exportLibrary, importLibrary, type SavedSong } from '../stores/songs'
-
-// 每拍 12 细分:直 16 分=3 格、三连 8 分=4 格、三连 16 分=2 格 —— 同一整数网格支持直音与三连音
-const SUBDIV = 12
-const DUR_CYCLE = [3, 4, 6, 12, 24, 48] // 16分 → 3连8分 → 8分 → 4分 → 2分 → 全音符
-const SNAP_DURS = [2, 3, 4, 6, 8, 9, 12, 16, 18, 24, 32, 36, 48]
+import { loadSongs, saveSong, deleteSong, exportLibrary, importLibrary, probeLibraryStorage, type SavedSong } from '../stores/songs'
 
 type Status = 'idle' | 'working' | 'done' | 'error'
 type Engine = 'dsp' | 'bp'
+
+/** 识别阶段允许的最高品:取指板的物理上限(22),**不跟随用户的「最高品」设置**。
+ *  原因(用户实测反馈):旧实现把 highestMidi 设成 tuning[top]+maxFret,超出该音域的音
+ *  在识别阶段就被丢掉了 —— 于是"改最高品"只在重建指法时生效,高把位的音**再也回不来**,
+ *  用户看到的却是"改了没用"。现在识别阶段收全指板,由指法阶段按用户设置过滤并**报告**
+ *  丢了几个音,用户调高最高品后点重建即可找回。 */
+const FULL_FRET = 22
 
 export default function TranscribePage() {
   const [audio, setAudio] = useState<AudioBuffer | null>(null)
   const [fileName, setFileName] = useState('')
   const [recording, setRecording] = useState(false)
   const [recSecs, setRecSecs] = useState(0)
+  /** 素材来自麦克风录音(单音演奏)还是导入文件(多为整曲混音):影响默认引擎/预设与提示 */
+  const [fromMic, setFromMic] = useState(false)
   const [status, setStatus] = useState<Status>('idle')
   const [errMsg, setErrMsg] = useState('')
   const [result, setResult] = useState<TranscribeResult | null>(null)
@@ -35,10 +41,45 @@ export default function TranscribePage() {
   const [bpProgress, setBpProgress] = useState<number | null>(null)
   const [bpStage, setBpStage] = useState<'model' | 'infer' | 'notes' | null>(null)
   const [bpBackend, setBpBackend] = useState('')
-  const [onsetThresh, setOnsetThresh] = useState(0.35)
-  const [frameThresh, setFrameThresh] = useState(0.2)
+  // 识别预设:把实测最优的参数固化下来(独奏/混音/失真三组),滑杆仍可微调
+  const [presetId, setPresetId] = useState<BpPresetId>('solo')
+  const [onsetThresh, setOnsetThresh] = useState(bpPreset('solo').onsetThresh)
+  const [frameThresh, setFrameThresh] = useState(bpPreset('solo').frameThresh)
+  const [minNoteLen, setMinNoteLen] = useState(bpPreset('solo').minNoteLenFrames)
+  const [melodia, setMelodia] = useState(bpPreset('solo').melodiaTrick)
+  // 召回聚合提取(失真预设启用):帧+onset 联合替代单帧双阈值,实测《God knows》
+  // 对人工参考谱一致度 5.9% → 20.6%(PLAN-90 阶段 2)
+  const [recallExtract, setRecallExtract] = useState(bpPreset('solo').recallExtract)
+  // 素材分层(阶段 5 能力分层):导入时测失真指数,高失真自动切「失真优先」
+  const [distTier, setDistTier] = useState<'clean' | 'distorted' | null>(null)
+  const [distVal, setDistVal] = useState(0)
+  const [retime, setRetime] = useState(true)
   const [ghostFilter, setGhostFilter] = useState(true)
   const [visibleBars, setVisibleBars] = useState(8)
+
+  /** 应用预设:一次设定阈值/最短音长/melodia 补音/召回提取(实测这几项互相耦合,分开调容易调坏)。
+   *  失真预设同时关掉八度重影过滤——它会把和弦内真实八度叠音当幻觉删掉(实测 −2.4pt)。 */
+  const applyPreset = (id: BpPresetId) => {
+    const p = bpPreset(id)
+    setPresetId(id)
+    setOnsetThresh(p.onsetThresh)
+    setFrameThresh(p.frameThresh)
+    setMinNoteLen(p.minNoteLenFrames)
+    setMelodia(p.melodiaTrick)
+    setRecallExtract(p.recallExtract)
+    if (p.recallExtract) setGhostFilter(false)
+  }
+
+  /** 素材失真分层:混音(dBFS 削波指纹)→ 干净/失真两档,决定预设与预期口径 */
+  const classifyMaterial = (buf: AudioBuffer) => {
+    const chs: Float32Array[] = []
+    for (let c = 0; c < buf.numberOfChannels; c++) chs.push(buf.getChannelData(c))
+    const mono = toMono(chs, buf.length)
+    const d = distortionIndex(resampleLinear(mono, buf.sampleRate, SR))
+    setDistVal(d)
+    setDistTier(d >= DISTORTION_ROUTE ? 'distorted' : 'clean')
+    return d >= DISTORTION_ROUTE
+  }
 
   // 响度过滤默认值随引擎切换:BP 的 amplitude≈响度,真实歌曲大量音符低于 0.55,
   // 会被整段删掉(实测 1151 音符只剩 80);DSP 的置信度保持 0.55
@@ -63,13 +104,18 @@ export default function TranscribePage() {
 
   const [songs, setSongs] = useState<SavedSong[]>(() => loadSongs())
   const [loadedSongName, setLoadedSongName] = useState<string | null>(null)
+  /** 曲库写入结果(必须如实显示:以前页面无条件写"已自动保存",失败时用户以为存上了) */
+  const [saveState, setSaveState] = useState<{ ok: boolean; text: string } | null>(null)
   const [droppedNotes, setDroppedNotes] = useState<DroppedNote[]>([])
   const [staleParams, setStaleParams] = useState(false)
   const [srcPlaying, setSrcPlaying] = useState(false)
   const [swingInfo, setSwingInfo] = useState<string | null>(null)
   const [keyFilter, setKeyFilter] = useState(false) // 调外音过滤(整曲混识别的幻觉音大多在调外)
   const [keyDropCount, setKeyDropCount] = useState(0)
-  const [autoDensity, setAutoDensity] = useState(true) // 自动密度:音符过多时按响度自动升阈值(整曲一次扒的关键)
+  // 低置信度复核:模型准确率有上限时,"让用户 3 秒找到并修掉可疑音符"比再提 1 个点更值钱
+  const [lowConfOnly, setLowConfOnly] = useState(false)
+  const [lowConfTh, setLowConfTh] = useState(0.5)
+  const [autoDensity, setAutoDensity] = useState(true) // 自动密度:音符过多时按响度自动升阈值(仅长素材 >90s 生效,且不删强音)
   const [autoDensityInfo, setAutoDensityInfo] = useState<string | null>(null)
   const [separate, setSeparate] = useState(false) // 分轨预处理:HPSS 去鼓 + 中侧 + 低频切除
   const [centerSuppress, setCenterSuppress] = useState(0.6) // 中置抑制强度(双轨吉他分居左右的混音开启)
@@ -84,6 +130,24 @@ export default function TranscribePage() {
   const shiftRef = useRef(0) // 量化时的整体归一偏移(谱面 step ↔ 原音频时间的换算)
   const autoSaveRef = useRef(false) // 识别成功后自动保存到曲库
   const autoNameRef = useRef('')
+  const savedNameRef = useRef<string | null>(null) // 已存进曲库的曲名(参数变化时同步更新它)
+  const tabRef = useRef<TabNote[]>([]) // 最新谱面(供防抖同步用,避免闭包拿到旧值)
+  const syncTimerRef = useRef(0)
+  /** 把当前谱面同步进曲库(参数微调后也会更新,兑现"调整参数会更新曲库"的承诺) */
+  const syncSavedSong = (bpmV: number, tuningIdV: string) => {
+    const name = savedNameRef.current
+    if (!name) return
+    window.clearTimeout(syncTimerRef.current)
+    syncTimerRef.current = window.setTimeout(() => {
+      const { songs: list, report } = saveSong(name, bpmV, tuningIdV, tabRef.current, SUBDIV)
+      setSongs(list)
+      setSaveState(
+        report.ok
+          ? { ok: true, text: `「${name}」已同步到曲库(${tabRef.current.length} 音符)` }
+          : { ok: false, text: `曲库同步失败:${report.error ?? '本地存储不可用'}` },
+      )
+    }, 600)
+  }
   const abTimerRef = useRef(0)
 
   const recRef = useRef<MicRecorder | null>(null)
@@ -97,54 +161,6 @@ export default function TranscribePage() {
   const loopRef = useRef<AudioBufferSourceNode | null>(null)
 
   const tuning = TUNINGS.find((t) => t.id === tuningId)?.midi ?? STANDARD_TUNING
-
-  /** 用音符起点序列细化 BPM:在估计值 ½–2 倍范围搜索,字典序目标——
-   *  ① 最优 60% 残差(RANSAC 式抗离群:伪起音造成的错位音不参与)尽量小;
-   *  ② 残差近最优(≤ 最优×1.5 + 0.02)的候选里取最接近初估者;③ 间隔 <2 格硬淘汰。
-   *  纯残差评分会退化地偏向慢速或任意倍速(均匀节奏在多个 BPM 下都是整数格),先验做最终裁决。 */
-  const refineBpm = (starts: number[], bpm0: number): number => {
-    if (starts.length < 4) return bpm0
-    const t0 = starts[0]
-    const evalAt = (c: number) => {
-      const g = 60 / c / SUBDIV
-      const residuals: number[] = []
-      const rounded: number[] = []
-      for (const t of starts) {
-        const r = (t - t0) / g
-        residuals.push(Math.abs(r - Math.round(r)))
-        rounded.push(Math.round(r))
-      }
-      residuals.sort((a, b) => a - b)
-      const k = Math.max(3, Math.floor(residuals.length * 0.6))
-      const robust = residuals.slice(0, k).reduce((a, b) => a + b, 0) / k
-      rounded.sort((a, b) => a - b)
-      let tooClose = 0
-      for (let i = 1; i < rounded.length; i++) {
-        if (rounded[i] - rounded[i - 1] < 2) tooClose++
-      }
-      return { robust, tooClose }
-    }
-    // 第一轮:最小 robust(忽略 tooClose,只作基准)
-    let minRobust = Infinity
-    for (let c = Math.max(40, bpm0 * 0.45); c <= bpm0 * 2.1 + 1e-9; c += 0.25) {
-      const { robust } = evalAt(c)
-      if (robust < minRobust) minRobust = robust
-    }
-    // 第二轮:残差近最优 + 无 tooClose 的候选里,取最接近初估者
-    let best = bpm0
-    let bestPrior = Infinity
-    for (let c = Math.max(40, bpm0 * 0.45); c <= bpm0 * 2.1 + 1e-9; c += 0.25) {
-      const { robust, tooClose } = evalAt(c)
-      if (tooClose > 0) continue
-      if (robust > minRobust * 1.5 + 0.02) continue
-      const prior = Math.abs(Math.log2(c / bpm0))
-      if (prior < bestPrior) {
-        bestPrior = prior
-        best = c
-      }
-    }
-    return Math.max(40, Math.min(220, Math.round(best)))
-  }
 
   useEffect(
     () => () => {
@@ -210,6 +226,10 @@ export default function TranscribePage() {
       setEngine('bp')
       setMinConf(0.25)
       setSeparate(true) // 导入的音频几乎都是完整混音,默认开启分轨预处理
+      // 素材分层:高失真混音走召回优先预设(草稿定位);干净混音走通用混音预设
+      if (classifyMaterial(buf)) applyPreset('dist')
+      else applyPreset('mix')
+      setFromMic(false)
     } catch {
       setErrMsg('无法解码该音频文件,请换 mp3/wav/m4a 格式。')
       setStatus('error')
@@ -234,10 +254,13 @@ export default function TranscribePage() {
       setStatus('idle')
       setResult(null)
       setLoadedSongName(null)
-      // 麦克风现场录音通常是单音演奏:默认 DSP(零模型加载,秒出)
+      // 麦克风现场录音通常是单音演奏:默认 DSP(零模型加载,秒出);失真分层只用于提示
       setEngine('dsp')
       setMinConf(0.55)
       setSeparate(false)
+      classifyMaterial(buf)
+      applyPreset('solo') // 独奏预设:只信有起音证据的音符(实测去伪音)
+      setFromMic(true)
       stopLoop()
       setSegStart(0)
       setSegLen(Math.min(4, buf.duration))
@@ -306,6 +329,8 @@ export default function TranscribePage() {
     }
     // 分轨预处理放在片段截取之后:整曲扒谱时只对需要区间做分离,快很多。
     // 输出 AudioBuffer 与输入等长等采样率,下游时间换算无需改动。
+    let sepBpmHint: number | undefined
+    let sepBassNotes: { start: number; end: number; midi: number }[] | undefined
     if (separate) {
       setSepProgress(0)
       setSepInfo(null)
@@ -313,8 +338,12 @@ export default function TranscribePage() {
         const { promise } = separateBuffer(target, { centerSuppress }, (pp) => setSepProgress(pp))
         const res = await promise
         target = res.buffer
+        sepBpmHint = res.bpmHint
+        sepBassNotes = res.bassNotes
         const share = res.energy.total > 0 ? res.energy.guitar / res.energy.total : 0
-        setSepInfo(`分轨预处理:吉他优先信号占提取能量 ${(share * 100).toFixed(0)}%`)
+        const bpmMsg = res.bpmHint ? ` · 鼓轨节拍 ${res.bpmHint} BPM` : ''
+        const gainMsg = res.levelGain > 1.05 ? ` · 电平补偿 +${(20 * Math.log10(res.levelGain)).toFixed(1)}dB` : ''
+        setSepInfo(`分轨预处理:吉他优先信号占提取能量 ${(share * 100).toFixed(0)}%${bpmMsg}${gainMsg}`)
       } catch (e) {
         setSepProgress(null)
         setStatus('error')
@@ -342,10 +371,17 @@ export default function TranscribePage() {
           {
             onsetThresh,
             frameThresh,
+            minNoteLenFrames: minNoteLen,
+            melodiaTrick: melodia,
+            recallExtract,
+            retime,
             removeOctaveGhosts: ghostFilter,
-            // 按当前调弦收紧音域:标准调弦下限 40(E2),Drop D/DADGAD 是 38(D2)
+            // 音域:下限按调弦(标准 40=E2,Drop D/DADGAD 38=D2),上限取全指板(见 FULL_FRET)
             lowestMidi: tuning[0],
-            highestMidi: tuning[tuning.length - 1] + maxFret,
+            highestMidi: tuning[tuning.length - 1] + FULL_FRET,
+            // 分离副产物:鼓轨 BPM 提示 + 贝斯单音线(八度幽灵参照)
+            bpmHint: sepBpmHint,
+            bassNotes: sepBassNotes,
           },
           (p) => setBpProgress(p),
           (stage, info) => {
@@ -365,6 +401,11 @@ export default function TranscribePage() {
         setBpm(r.bpmStrength && r.bpmStrength > 0.2 ? r.bpm : refineBpm(r.notes.map((n) => n.start), r.bpm))
         autoSaveRef.current = true
         autoNameRef.current = name
+        // 关键修复:新一轮识别成功后清掉"有手工编辑"标记,否则下面的重建会被跳过,
+        // 结果既不显示也不存曲库(用户实测"扒完一刷新曲库是空的"的直接原因之一)。
+        // 只在成功时清:失败时保留标记,用户之前的手工编辑仍受保护。
+        dirtyRef.current = false
+        setStaleParams(false)
         setVisibleBars(8)
         setStatus('done')
       } catch (e) {
@@ -403,6 +444,9 @@ export default function TranscribePage() {
         setBpm(r.bpmStrength && r.bpmStrength > 0.2 ? r.bpm : refineBpm(r.notes.map((n) => n.start), r.bpm))
         autoSaveRef.current = true
         autoNameRef.current = name
+        // 同 BP 路径:清掉"有手工编辑"标记,保证新结果能重建并自动入曲库
+        dirtyRef.current = false
+        setStaleParams(false)
         setVisibleBars(8)
         setStatus('done')
       } else if (e.data.type === 'error') {
@@ -419,95 +463,70 @@ export default function TranscribePage() {
       const src = target.getChannelData(c)
       for (let i = 0; i < src.length; i++) ch[i] += src[i] / nCh
     }
-    worker.postMessage({ type: 'transcribe', channel: ch, sampleRate: target.sampleRate }, [ch.buffer])
+    worker.postMessage(
+      {
+        type: 'transcribe',
+        channel: ch,
+        sampleRate: target.sampleRate,
+        bpmHint: sepBpmHint,
+        // 音域:下限按调弦(旧实现硬编码 40..88,Drop D 的 D2 会被报成 E2);上限取全指板
+        lowestMidi: tuning[0],
+        highestMidi: tuning[tuning.length - 1] + FULL_FRET,
+      },
+      [ch.buffer],
+    )
   }
 
   // ---------- 量化 + 指法 ----------
+  // 量化逻辑抽到 src/transcription/quantize.ts(纯函数):页面与评测走同一段代码,
+  // 这样"用户最终看到的谱面"能被度量,而不是只有识别阶段的乐观上界。
 
   const rebuild = () => {
     if (!result) return
-    const gridSec = 60 / bpm / SUBDIV
-    const anchor = result.offset - offsetSteps * gridSec
-    // 自动密度:整曲混识别的音符量远超可读范围(几分钟的歌动辄数千个),
-    // 按响度升阈值只保留最响的主声部(≤3 音符/秒);手动阈值更高时以手动为准
-    let effMinConf = minConf
-    if (autoDensity && rawNotes.length > result.duration * 3) {
-      const target = Math.max(60, Math.ceil(result.duration * 3))
-      const sorted = rawNotes.map((n) => n.confidence).sort((a, b) => b - a)
-      const keep = Math.min(target, sorted.length)
-      effMinConf = Math.max(minConf, Math.min(0.85, sorted[keep - 1]))
-      setAutoDensityInfo(
-        `自动密度:响度阈值 ${minConf.toFixed(2)} → ${effMinConf.toFixed(2)},保留 ${keep}/${rawNotes.length} 个最响的音符`,
-      )
-    } else {
-      setAutoDensityInfo(null)
-    }
-    const filtered = rawNotes.filter((n) => n.confidence >= effMinConf)
-    const q: { midi: number; step: number; dur: number; conf: number }[] = []
-    for (const n of filtered) {
-      // 不 clamp 到 0:起音检测滞后时音符可以在锚点之前(往左对齐的物理基础)
-      const step = Math.round((n.start - anchor) / gridSec)
-      let dur = Math.round((n.end - n.start) / gridSec)
-      dur = SNAP_DURS.reduce((best, d) => (Math.abs(d - dur) < Math.abs(best - dur) ? d : best), 3)
-      dur = Math.max(2, dur)
-      q.push({ midi: n.midi, step, dur, conf: n.confidence })
-    }
-    q.sort((a, b) => a.step - b.step)
-    // 去掉完全同 step 同 midi 的重复
-    const dedup = q.filter((n, i) => !(i > 0 && n.step === q[i - 1].step && n.midi === q[i - 1].midi))
-    // 负步整体归一:最早音符落在 step 0(渲染层不支持负步)
-    const shift = Math.min(0, ...dedup.map((n) => n.step))
-    shiftRef.current = shift
-    const shifted0 = shift < 0 ? dedup.map((n) => ({ ...n, step: n.step - shift })) : dedup
-    // 步进吸附清理:±1 格内吸附到最近的直音(3 的倍数)或三连音(4 的倍数)网格,消除检测抖动
-    const shifted = shifted0.map((n) => {
-      const near3 = Math.round(n.step / 3) * 3
-      const near4 = Math.round(n.step / 4) * 4
-      const d3 = Math.abs(n.step - near3)
-      const d4 = Math.abs(n.step - near4)
-      let step = n.step
-      if (d3 <= 1 && d3 < d4) step = near3
-      else if (d4 <= 1 && d4 <= d3) step = near4
-      return { ...n, step }
+    const q = quantizeNotes(rawNotes, result.duration, {
+      bpm,
+      anchor: result.offset,
+      offsetSteps,
+      minConf,
+      autoDensity,
+      keyFilter: keyFilter ? keyGuess : null,
     })
-    // 吸附后可能撞出重复(同 step 同 midi),再去重
-    const dedup2 = shifted.filter((n, i) => !(i > 0 && n.step === shifted[i - 1].step && n.midi === shifted[i - 1].midi))
-    // swing/shuffle 检测:拍内位置(模 12)集中于 7-9(三连音反拍)即有 swing 感
-    const modCounts = new Array(SUBDIV).fill(0)
-    for (const n of dedup2) modCounts[((n.step % SUBDIV) + SUBDIV) % SUBDIV]++
-    const totalN = dedup2.length
-    const swung = modCounts[7] + modCounts[8] + modCounts[9]
-    if (totalN >= 6 && swung / totalN >= 0.25) {
-      const mode = [7, 8, 9].reduce((a, b) => (modCounts[b] > modCounts[a] ? b : a), 7)
-      setSwingInfo(
-        mode === 8
-          ? '检测到 shuffle/swing 节奏(反拍落在三连音位置,≈67%)—— 12 细分网格已自动对齐三连音'
-          : `检测到轻微 swing(反拍偏移至 ${Math.round((mode / 6) * 100)}%)`,
-      )
-    } else {
-      setSwingInfo(null)
-    }
-    // 复音上限:同一格最多 6 个音(吉他弦数),混音识别的密集簇保留最响的
-    let finalQ = capPolyphony(dedup2, 6)
-    // 调外音过滤(可选):整曲混识别的差半音幻觉音大多在调外(布鲁斯音也会被滤,慎用)
-    if (keyFilter && keyGuess) {
-      const inKey = filterToKey(finalQ, keyGuess)
-      setKeyDropCount(finalQ.length - inKey.length)
-      finalQ = inKey
-    } else {
-      setKeyDropCount(0)
-    }
-    const { notes: tab, dropped } = assignFingering(finalQ, tuning, maxFret)
+    shiftRef.current = q.shift
+    setAutoDensityInfo(q.autoDensityInfo)
+    setSwingInfo(q.swingInfo)
+    setKeyDropCount(q.keyDropCount)
+    const { notes: tab, dropped } = assignFingering(q.notes, tuning, maxFret)
     nextIdRef.current = tab.length + 1
     setNotes(tab)
+    tabRef.current = tab
     setDroppedNotes(dropped)
     setSelectedId(null)
     dirtyRef.current = false
     setStaleParams(false)
-    // 识别成功后的第一次重建 → 自动保存到曲库(同名覆盖),刷新/切页不再丢结果
+    // 识别成功后的第一次重建 → 自动保存到曲库(同名覆盖),刷新/切页不再丢结果。
+    // 保存结果必须如实显示:写入可能因配额/隐私设置失败,以前页面无条件写"已自动保存"。
     if (autoSaveRef.current) {
       autoSaveRef.current = false
-      setSongs(saveSong(autoNameRef.current, bpm, tuningId, tab, SUBDIV))
+      const { songs: list, report } = saveSong(autoNameRef.current, bpm, tuningId, tab, SUBDIV)
+      savedNameRef.current = autoNameRef.current
+      setSongs(list)
+      setSaveState(
+        report.ok
+          ? {
+              ok: true,
+              text:
+                report.dropped > 0
+                  ? `已自动保存「${autoNameRef.current}」(${tab.length} 音符);浏览器空间不足,已丢弃 ${report.dropped} 首旧曲目`
+                  : `已自动保存「${autoNameRef.current}」(${tab.length} 音符,曲库共 ${report.count} 首)`,
+            }
+          : {
+              ok: false,
+              text: `自动保存失败:${report.error ?? '浏览器本地存储不可用'}(可能空间已满或处于无痕模式)。谱面只在当前页面有效,请点「⬇ 导出曲库」备份到文件。`,
+            },
+      )
+    } else {
+      // 参数微调导致的重建:同步更新已存的那首(防抖,避免拖动滑杆时反复写盘)
+      syncSavedSong(bpm, tuningId)
     }
   }
 
@@ -530,9 +549,18 @@ export default function TranscribePage() {
   )
   // 长谱分页渲染:默认只渲染前 N 小节(每小节 48 格 × 6 弦的交互热区会让 DOM 爆炸)
   const totalBars = Math.max(1, Math.ceil(totalSteps / 48))
+  // 低置信度复核:byStep 过滤 + 谱面着色(conf 由 assignFingering 一路带到这里)
+  const lowConfCount = useMemo(() => notes.filter((n) => (n.conf ?? 1) < lowConfTh).length, [notes, lowConfTh])
+  /** 起音支撑率过低 = 模型没把握:直接来自「起音对时」移动的音符数(零额外开销),
+   *  标尺是真实 GuitarSet 实测(干净独奏 ≈79%、和弦伴奏 ≈45%)。
+   *  低于 30% 时提示"关掉分轨预处理/缩小片段"——整曲混音上这是最常见的可救项。 */
+  const onsetSupportHint = useMemo(() => {
+    if (!result || engine !== 'bp' || rawNotes.length < 20 || result.retimed === undefined) return false
+    return result.retimed / rawNotes.length < 0.3
+  }, [result, engine, rawNotes.length])
   const visibleNotes = useMemo(
-    () => notes.filter((n) => n.step < visibleBars * 48),
-    [notes, visibleBars],
+    () => notes.filter((n) => n.step < visibleBars * 48 && (!lowConfOnly || (n.conf ?? 1) < lowConfTh)),
+    [notes, visibleBars, lowConfOnly, lowConfTh],
   )
   const visibleSteps = Math.min(totalSteps, visibleBars * 48)
   const avgConf = useMemo(
@@ -541,6 +569,7 @@ export default function TranscribePage() {
   )
 
   // ---------- 编辑(任何手工编辑都会置脏,参数变化不再自动覆盖) ----------
+  // 手工改过的音符置信度视为 1(用户已确认),不再显示为可疑
 
   const markDirty = () => {
     dirtyRef.current = true
@@ -548,7 +577,7 @@ export default function TranscribePage() {
 
   const updateNote = (id: number, patch: Partial<TabNote>) => {
     markDirty()
-    setNotes((ns) => ns.map((n) => (n.id === id ? { ...n, ...patch } : n)))
+    setNotes((ns) => ns.map((n) => (n.id === id ? { ...n, conf: 1, ...patch } : n)))
   }
 
   const shiftString = (dir: number) => {
@@ -595,8 +624,18 @@ export default function TranscribePage() {
     if (notes.length === 0) return
     const name = window.prompt('曲谱名称:', (loadedSongName ?? fileName.replace(/\(.*$/, '')) || '未命名')
     if (name === null) return
-    setSongs(saveSong(name, bpm, tuningId, notes, SUBDIV))
+    const { songs: list, report } = saveSong(name, bpm, tuningId, notes, SUBDIV)
+    setSongs(list)
     setLoadedSongName(name)
+    if (report.ok) {
+      savedNameRef.current = name
+      setSaveState({ ok: true, text: `已保存「${name}」(${notes.length} 音符,曲库共 ${report.count} 首)` })
+    } else {
+      setSaveState({
+        ok: false,
+        text: `保存失败:${report.error ?? '浏览器本地存储不可用'}。请先点「⬇ 导出曲库」把谱面存成文件,或清理浏览器存储后重试。`,
+      })
+    }
   }
 
   const loadSong = (s: SavedSong) => {
@@ -829,7 +868,7 @@ export default function TranscribePage() {
               title="Spotify Basic Pitch 神经网络,支持和弦等复音;首次使用需加载 AI 引擎(约 2MB,之后有缓存)">🧠 Basic Pitch(复音 · AI)</button>
             {audio && (
               <button className={`chip${separate ? ' active' : ''}`} onClick={() => setSeparate(!separate)}
-                title="分轨预处理:HPSS 去掉鼓的瞬态、中侧分解压低居中的内容、切除 70Hz 以下(贝斯基频的谐波会变成幽灵音)。整曲扒谱强烈建议开启;独奏/现场录音可关闭">
+                title="分轨预处理:HPSS 去掉鼓的瞬态、中侧分解压低居中的内容、切除 50Hz 以下(贝斯/隆隆声)。整曲扒谱建议开启;独奏/现场录音可关闭">
                 🎛 分轨预处理{separate ? '开' : '关'}
               </button>
             )}
@@ -839,17 +878,68 @@ export default function TranscribePage() {
                   onChange={(e) => setCenterSuppress(parseFloat(e.target.value))} style={{ width: 120 }} />
               </label>
             )}
+            {/* 调弦与最高品是**识别输入**(影响音域与指法),所以放在扒谱按钮之前,
+                不再藏在识别完成后的结果面板里 */}
+            <label className="field">调弦
+              <select value={tuningId} onChange={(e) => setTuningId(e.target.value)}
+                title="影响识别音域下限(Drop D/DADGAD 是 D2=38)与指法分配">
+                {TUNINGS.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </label>
+            <label className="field">最高品
+              <select value={maxFret} onChange={(e) => setMaxFret(parseInt(e.target.value))}
+                title="指板可用到第几品:只影响指法分配(超出该品的音会进「丢弃」提示)。识别阶段收全指板,所以调高后点重建即可找回高把位的音">
+                {[12, 15, 18, 22].map((f) => <option key={f} value={f}>{f}</option>)}
+              </select>
+            </label>
           </div>
           {engine === 'bp' && (
             <>
+              <div className="chip-row">
+                <span className="muted small">识别预设:</span>
+                <button className={`chip${presetId === 'solo' ? ' active' : ''}`} onClick={() => applyPreset('solo')}
+                  title="干净独奏/单吉他录音:ot0.55/ft0.40、最短音长 6 帧、关 melodia。真实 GuitarSet 寻优 83.35%">
+                  🎸 干净独奏
+                </button>
+                <button className={`chip${presetId === 'mix' ? ' active' : ''}`} onClick={() => applyPreset('mix')}
+                  title="通用混音(整曲导入,无削波指纹):ot0.55/ft0.40、最短音长 10 帧、关 melodia">
+                  🎚 通用混音
+                </button>
+                <button className={`chip${presetId === 'dist' ? ' active' : ''}`} onClick={() => applyPreset('dist')}
+                  title="高失真混音·召回优先:帧+onset 聚合提取(阶段2)。失真素材的瓶颈是召回,收紧阈值只会把真音连同幻觉一起删——实测《God knows》对人工参考谱一致度 5.9%→20.6%(阈值上限 26%)。产物定位草稿,靠置信度着色人工修">
+                  🔥 失真优先
+                </button>
+                {(onsetThresh !== bpPreset(presetId).onsetThresh ||
+                  frameThresh !== bpPreset(presetId).frameThresh ||
+                  minNoteLen !== bpPreset(presetId).minNoteLenFrames ||
+                  melodia !== bpPreset(presetId).melodiaTrick ||
+                  recallExtract !== bpPreset(presetId).recallExtract) && (
+                  <button className="chip" onClick={() => applyPreset(presetId)} title="把下面几项恢复成预设值">
+                    ↺ 恢复预设
+                  </button>
+                )}
+              </div>
               <label className="field">起音阈值 {onsetThresh.toFixed(2)}(识别过多调高)
-                <input type="range" min="0.2" max="0.7" step="0.05" value={onsetThresh}
-                  onChange={(e) => setOnsetThresh(parseFloat(e.target.value))} style={{ width: 150 }} />
+                <input type="range" min="0.2" max="0.8" step="0.05" value={onsetThresh}
+                  onChange={(e) => setOnsetThresh(parseFloat(e.target.value))} style={{ width: 130 }} />
               </label>
               <label className="field">延音阈值 {frameThresh.toFixed(2)}(尾音拖长调高)
                 <input type="range" min="0.08" max="0.5" step="0.02" value={frameThresh}
-                  onChange={(e) => setFrameThresh(parseFloat(e.target.value))} style={{ width: 150 }} />
+                  onChange={(e) => setFrameThresh(parseFloat(e.target.value))} style={{ width: 130 }} />
               </label>
+              <label className="field">最短音长 {minNoteLen} 帧≈{((minNoteLen + 1) / 86 * 1000).toFixed(0)}ms
+                <input type="range" min="2" max="16" step="1" value={minNoteLen}
+                  onChange={(e) => setMinNoteLen(parseInt(e.target.value))} style={{ width: 110 }}
+                  title="短于此长度的音符不会被输出。调小能捞回快速经过音,但也会放进虚假短音(实测调到 4 以下会明显掉精确率)" />
+              </label>
+              <button className={`chip${melodia ? ' active' : ''}`} onClick={() => setMelodia(!melodia)}
+                title="melodia 残差补音:在起音证据之外再从剩余能量里补音符。混音/和弦建议开(补同时发声),干净独奏建议关(实测精确率 89.8% → 92.0%)">
+                残差补音{melodia ? '开' : '关'}
+              </button>
+              <button className={`chip${retime ? ' active' : ''}`} onClick={() => setRetime(!retime)}
+                title="起音对时:BP 的音符起点是 86fps 帧量化(11.6ms),用 DSP 起音检测(实测偏差 ≤3.4ms)逐音校正。实测量化谱面 F1 +7.4 点">
+                ⏱ 起音对时{retime ? '开' : '关'}
+              </button>
               <button className={`chip${ghostFilter ? ' active' : ''}`} onClick={() => setGhostFilter(!ghostFilter)}
                 title="模型常见幻觉:同一时间多出高/低八度的音。单旋律保持开启;和弦含真八度时关闭">
                 八度重影过滤{ghostFilter ? '开' : '关'}
@@ -857,6 +947,19 @@ export default function TranscribePage() {
             </>
           )}
         </div>
+        {/* 能力分层(PLAN-90 阶段 5):按素材判定给出诚实预期,不承诺一键完美 */}
+        {audio && distTier === 'distorted' && (
+          <div className="warn-box mt">
+            🔥 素材判定:<b>高失真混音</b>(失真指数 {distVal.toFixed(2)},路由阈值 {DISTORTION_ROUTE})——已自动切换「🔥 失真优先」预设(召回优先 + 聚合提取)。
+            诚实预期:这类素材的盲扒产物是<b>草稿</b>(实测《God knows》对人工参考谱一致度约 21%,已接近该类素材公开最好水平;阈值理论上限 26%)。
+            修谱顺序:先看谱面<b>橙色低置信音</b> → 用「⇄ A/B 对比」逐段核对 → 网上若有现成谱(Songsterr 等),仓库 REF 模式可直接得到人工谱水平的曲库(导入即用)。
+          </div>
+        )}
+        {audio && distTier === 'clean' && (
+          <div className="muted small mt">
+            🎸 素材判定:干净(失真指数 {distVal.toFixed(2)})。干净独奏录音的音符级准确率约 83%(真实 GuitarSet 30 片段,onset ±50ms + 音高全等);混音导入请保持「🎛 分轨预处理」开。
+          </div>
+        )}
         {status === 'error' && <div className="warn-box mt">{errMsg}</div>}
         {status === 'working' && sepProgress !== null && (
           <div className="muted small mt">
@@ -872,9 +975,17 @@ export default function TranscribePage() {
               : `正在分析:${fileName}(起音检测 → 逐帧音高 → 音符分割 → 节拍量化)。长音频可能需要几十秒。`}
           </div>
         )}
-        {engine === 'bp' && audio && audio.duration > 240 && status !== 'done' && (
+        {engine === 'bp' && audio && !fromMic && audio.duration > 60 && status !== 'done' && (
           <div className="warn-box mt">
-            音频较长({Math.round(audio.duration / 60)} 分钟):可以整曲一次扒——建议开启 <b>🎛 分轨预处理</b> 并保持 <b>🎚 自动密度</b> + <b>🎹 调性过滤</b>,识别后先用 A/B 对比核对;想要更精细的主音轨,用 <b>✂ 只扒片段</b> 分段扒(分轨只对片段做,快很多)。
+            🎵 这是<b>导入的整曲({audio.duration < 120 ? `${Math.round(audio.duration)} 秒` : `${Math.round(audio.duration / 60)} 分钟`})</b>:
+            复音 AI 在「整曲混音」上的准确率天然最低(真实失真混音对人工参考谱的音符级一致度量级在 20% 左右,鼓、贝斯、人声都会带来伪音)。
+            想要更准,按这个顺序来:
+            <div style={{ marginTop: 6 }}>
+              ① <b>✂ 只扒片段</b>:一次扒 8~30 秒(先用下面的「🔁 循环原片段」找到要扒的段落),分轨与识别都只处理这一段,又快又准;
+              ② {distTier === 'distorted' ? <>保持 <b>🔥 失真优先</b> 预设(召回优先,别手紧阈值)</> : <>保持 <b>🎛 分轨预处理</b> 开(去鼓 + 压低居中的人声/贝斯),并可打开 <b>🎹 调性过滤</b></>};
+              ③ 识别后先 <b>⇅ A/B 对比</b> 核对节奏,再点谱面上<b>橙色</b>的低置信度音符逐个修正 —— 这一步对"可用度"的提升最大。
+            </div>
+            <div style={{ marginTop: 4 }} className="muted small">整曲一次扒仍然可用,只是把它当"草稿",别指望直接导出就能弹;网上已有谱的歌,REF 模式可以直接到人工谱水平。</div>
           </div>
         )}
       </div>
@@ -921,12 +1032,28 @@ export default function TranscribePage() {
             {songs.map((s) => (
               <span key={s.id} className={`chip${loadedSongName === s.name ? ' active' : ''}`} style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
                 <span style={{ cursor: 'pointer' }} onClick={() => loadSong(s)}
-                  title={`${s.bpm} BPM · ${s.notes.length} 音符 · ${new Date(s.updatedAt).toLocaleString('zh-CN')} · 点击加载`}>
-                  {s.name} · {s.bpm}bpm · {new Date(s.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+                  title={`${s.bpm} BPM · ${s.notes.length} 音符 · ${new Date(s.updatedAt).toLocaleString('zh-CN')}${s.source === 'ref' ? ' · 📖 参考谱模式产物(人工谱+逐音音频验证)' : ''} · 点击加载`}>
+                  {s.source === 'ref' && <b title="参考谱模式产物:人工参考谱 + 对齐 + 逐音音频验证(见仓库 REF.md)">📖</b>}{s.name} · {s.bpm}bpm · {new Date(s.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
                 </span>
                 <span style={{ cursor: 'pointer', color: 'var(--err)' }} onClick={() => removeSong(s.id)} title="删除">×</span>
               </span>
             ))}
+          </div>
+        )}
+        {songs.length === 0 && (
+          <div className="muted small" style={{ marginBottom: 10, lineHeight: 1.7 }}>
+            曲库是空的。谱面存在<b>当前浏览器 + 当前地址</b>({typeof location !== 'undefined' ? location.origin : ''})的本地存储里,所以:
+            <b>换端口/换浏览器/无痕模式/清理浏览数据</b>都会看到空库 —— 这不是识别失败。
+            {(() => {
+              const s = probeLibraryStorage()
+              return s.available
+                ? s.usedBytes > 0
+                  ? ` (检测到本地存储里其实有 ${(s.usedBytes / 1024).toFixed(0)}KB 数据但解析失败,已自动备份到 gm-songs-corrupt-* 键)`
+                  : ' (本地存储可正常读写)'
+                : ` ⚠ 本地存储当前不可用(${s.error}),扒谱结果无法持久化,请用「⬇ 导出曲库」手动备份。`
+            })()}
+            <br />
+            另外:扒谱成功会自动入库,但<b>识别中途刷新页面会丢失</b>(那一次还没入库);重要结果建议随手导出一份文件。
           </div>
         )}
         <div className="row">
@@ -942,7 +1069,13 @@ export default function TranscribePage() {
               if (!f) return
               try {
                 const text = await f.text()
-                setSongs(importLibrary(text))
+                const { songs: list, report } = importLibrary(text)
+                setSongs(list)
+                setSaveState(
+                  report.ok
+                    ? { ok: true, text: `已导入,曲库共 ${report.count} 首` + (report.dropped > 0 ? `(空间不足丢弃 ${report.dropped} 首)` : '') }
+                    : { ok: false, text: `导入写入失败:${report.error ?? '本地存储不可用'}` },
+                )
               } catch (err) {
                 setErrMsg('导入失败:' + String(err))
               }
@@ -972,16 +1105,6 @@ export default function TranscribePage() {
                   <input type="range" min="0.05" max="0.95" step="0.05" value={minConf}
                     onChange={(e) => setMinConf(parseFloat(e.target.value))} style={{ width: 130 }} />
                 </label>
-                <label className="field">最高品
-                  <select value={maxFret} onChange={(e) => setMaxFret(parseInt(e.target.value))}>
-                    {[12, 15, 18, 22].map((f) => <option key={f} value={f}>{f}</option>)}
-                  </select>
-                </label>
-                <label className="field">调弦
-                  <select value={tuningId} onChange={(e) => setTuningId(e.target.value)}>
-                    {TUNINGS.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-                  </select>
-                </label>
                 <button
                   className={`chip${keyFilter ? ' active' : ''}`}
                   onClick={() => setKeyFilter(!keyFilter)}
@@ -993,7 +1116,7 @@ export default function TranscribePage() {
                 <button
                   className={`chip${autoDensity ? ' active' : ''}`}
                   onClick={() => setAutoDensity(!autoDensity)}
-                  title="音符过多时按响度自动升阈值,只保留最响的主声部(≤3 音符/秒)——整曲一次扒建议开启"
+                  title="音符过多时按响度自动升阈值,只保留最响的主声部(≤3 音符/秒)。只在长素材(>90s)上生效,且响度 >0.6 的强音永远不会被删"
                 >
                   🎚 自动密度{autoDensity ? '开' : '关'}
                 </button>
@@ -1004,10 +1127,65 @@ export default function TranscribePage() {
               <div className="muted small mt">
                 识别到 {rawNotes.length} 个音符{engine === 'bp' ? '(复音,含同时发声;响度过滤会删掉弱奏音,慎用)' : ''} · 平均置信度 {(avgConf * 100).toFixed(0)}%
                 {result.bpmStrength ? ` · 节拍锁定 ${(result.bpmStrength * 100).toFixed(0)}%(${bpm} BPM)` : ''}
+                {result.retimed ? ` · ⏱ 起音对时 ${result.retimed} 个` : ''}
+                {result.tuningCents !== undefined && Math.abs(result.tuningCents) >= 5
+                  ? ` · 🎼 检测到整体音准偏移 ${result.tuningCents > 0 ? '+' : ''}${result.tuningCents} 音分,已校正`
+                  : ''}
                 {keyGuess ? ` · 检测调性 ${keyGuess.name}` : ''}
                 {sepInfo ? ` · ${sepInfo}` : ''}
-                {keyFilter && keyDropCount > 0 ? ` · 调性过滤删掉 ${keyDropCount} 个调外音` : ''} · 建议先核对节奏(用◀▶对齐第一拍)。结果<b>已自动保存到下方曲库</b>(同名覆盖),刷新不丢;调整参数会重建谱面并更新曲库。
+                {keyFilter && keyDropCount > 0 ? ` · 调性过滤删掉 ${keyDropCount} 个调外音` : ''} · 建议先核对节奏(用◀▶对齐第一拍)。
               </div>
+              {saveState && (
+                <div
+                  className="mt"
+                  style={{
+                    background: saveState.ok ? 'rgba(76,194,169,0.08)' : 'rgba(240,120,92,0.12)',
+                    border: `1px solid ${saveState.ok ? 'rgba(76,194,169,0.35)' : 'rgba(240,120,92,0.45)'}`,
+                    borderRadius: 10,
+                    padding: '8px 12px',
+                    color: saveState.ok ? 'var(--accent)' : 'var(--err)',
+                    fontSize: 13,
+                  }}
+                >
+                  {saveState.ok ? '💾 ' : '⚠ '}
+                  {saveState.text}
+                  {!saveState.ok && (
+                    <span className="muted small">(谱面仍在当前页面可用,可继续编辑/导出)</span>
+                  )}
+                </div>
+              )}
+              {lowConfCount > 0 && (
+                <div className="mt" style={{ background: 'rgba(240,180,92,0.08)', border: '1px solid rgba(240,180,92,0.3)', borderRadius: 10, padding: '8px 12px' }}>
+                  <div className="row">
+                    <span className="muted small">
+                      🔍 有 <b>{lowConfCount}</b> 个音符置信度低于 {lowConfTh.toFixed(2)}(谱面上标为橙色),建议优先核对
+                    </span>
+                    <div className="spacer" />
+                    <button className={`chip${lowConfOnly ? ' active' : ''}`} onClick={() => setLowConfOnly(!lowConfOnly)}
+                      title="只显示低置信度音符,便于逐个试听核对(不影响播放/导出)">
+                      {lowConfOnly ? '显示全部' : '只看可疑音'}
+                    </button>
+                    <label className="field">阈值 {lowConfTh.toFixed(2)}
+                      <input type="range" min="0.2" max="0.8" step="0.05" value={lowConfTh}
+                        onChange={(e) => setLowConfTh(parseFloat(e.target.value))} style={{ width: 90 }} />
+                    </label>
+                  </div>
+                </div>
+              )}
+              {engine === 'bp' && onsetSupportHint && (
+                <div className="warn-box mt">
+                  ⚠ 本次只有 <b>{((result.retimed ?? 0) / Math.max(1, rawNotes.length) * 100).toFixed(0)}%</b> 的音符能在原音频里
+                  找到对应的起音(干净独奏实测 ≈79%,和弦伴奏 ≈45%,对不上说明模型没把握)。
+                  {sepInfo && separate ? (
+                    <>
+                      {' '}你这首开了 <b>🎛 分轨预处理</b> —— 它会削弱拨弦瞬态,在本来就不算脏的素材上反而有害。
+                      建议<b>关掉分轨预处理后重扒一次</b>对比。
+                    </>
+                  ) : (
+                    <> 建议:① 用 <b>✂ 只扒片段</b> 缩小到 8~30 秒;② 试 <b>🎸 干净独奏</b> 预设;③ 确认调弦/最高品选对。</>
+                  )}
+                </div>
+              )}
               {swingInfo && (
                 <div className="mt" style={{ background: 'rgba(124,108,240,0.1)', border: '1px solid rgba(124,108,240,0.35)', borderRadius: 10, padding: '8px 12px', color: 'var(--accent2)', fontSize: 13 }}>
                   ♪ {swingInfo}
@@ -1077,6 +1255,7 @@ export default function TranscribePage() {
               totalSteps={visibleSteps}
               selectedId={selectedId}
               playheadStep={playheadStep}
+              lowConfTh={lowConfTh}
               onSelect={(id) => { setSelectedId(id); if (id !== null) setPenFret(null) }}
               onSlotClick={penFret !== null ? insertAt : undefined}
             />

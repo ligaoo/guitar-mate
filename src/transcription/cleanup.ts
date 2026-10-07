@@ -1,6 +1,7 @@
-// 扒谱后整理:调性检测 / 调外音过滤 / 复音上限修剪
-// 整曲识别的输出是全部乐器的"音符汤",这三步把它修剪成吉他可弹的谱
+// 扒谱后整理:调性检测 / 调外音过滤 / 复音上限修剪 / 和弦词典吸附
+// 整曲识别的输出是全部乐器的"音符汤",这几步把它修剪成吉他可弹的谱
 import { mod12 } from '../theory/notes'
+import { CHORD_TYPES } from '../theory/chords'
 
 export interface KeyGuess {
   rootPc: number
@@ -73,4 +74,80 @@ export function capPolyphony<T extends { step: number; conf: number }>(notes: T[
     }
   }
   return out.sort((a, b) => a.step - b.step)
+}
+
+// ---- 和弦词典 snap ----
+
+/** 全部(根音 × 和弦类型)的音级集合。add9 的 14 折回 2 后与 sus2 同集也无妨 */
+const CHORD_PC_LISTS: number[][] = CHORD_TYPES.flatMap((t) => {
+  const pcs = [...new Set(t.intervals.map((i) => i % 12))]
+  const out: number[][] = []
+  for (let root = 0; root < 12; root++) out.push(pcs.map((p) => (p + root) % 12))
+  return out
+})
+
+/** 音级集合是否被某个和弦完整包含(吉他常只按和弦的一部分音,允许缺音) */
+export function fitsChord(midis: number[]): boolean {
+  const pcs = [...new Set(midis.map((m) => mod12(m)))]
+  if (pcs.length < 3) return true // 单音/双音不判
+  outer: for (const chord of CHORD_PC_LISTS) {
+    if (chord.length < pcs.length) continue
+    for (const p of pcs) if (!chord.includes(p)) continue outer
+    return true
+  }
+  return false
+}
+
+/** 音级集合是否与某个和弦的音级集合完全相等 */
+function exactChord(midis: number[]): boolean {
+  const pcs = [...new Set(midis.map((m) => mod12(m)))].sort((a, b) => a - b)
+  if (pcs.length < 3) return false
+  return CHORD_PC_LISTS.some((c) => c.length === pcs.length && c.every((p) => pcs.includes(p)))
+}
+
+/**
+ * 和弦词典 snap:起音落在 60ms 内的同时发音簇(3~6 音),若其音级不构成任何
+ * 和弦的子集,尝试把**恰好一个音**移 ±1 半音使之成立;找到才改,找不到保持原样。
+ * 两遍扫描:先接受"调整后与某和弦精确相等"(证据强),再接受"是其子集"(部分 voicing)。
+ *
+ * 刻意保守:每簇最多修一个音、最多 1 半音——识别噪声造成的"差半音幻觉音"
+ * 大多落在这类修正范围内,而真正的旋律性半音经过(不属于任何和弦)不会被硬掰。
+ */
+export function snapClustersToChords<T extends { start: number; end: number; midi: number }>(notes: T[]): T[] {
+  if (notes.length < 3) return notes
+  const out = notes.map((n) => ({ ...n }))
+  out.sort((a, b) => a.start - b.start || a.midi - b.midi)
+  const clusters: T[][] = []
+  let cur: T[] = [out[0]]
+  for (let i = 1; i < out.length; i++) {
+    if (out[i].start - cur[cur.length - 1].start <= 0.06) cur.push(out[i])
+    else {
+      clusters.push(cur)
+      cur = [out[i]]
+    }
+  }
+  clusters.push(cur)
+  const origDistinct = (midis: number[]) => new Set(midis.map((m) => mod12(m))).size
+  for (const cl of clusters) {
+    if (cl.length < 3 || cl.length > 6) continue
+    const base = cl.map((n) => n.midi)
+    if (fitsChord(base)) continue
+    let done = false
+    for (const strict of [exactChord, fitsChord]) {
+      if (done) break
+      outer: for (let i = 0; i < cl.length; i++) {
+        for (const d of [-1, 1]) {
+          const midis = cl.map((n, k) => (k === i ? n.midi + d : n.midi))
+          // 音级数不得减少:把一个音并到另一个音的音级上等于丢和弦音(信息损失),不算修复
+          if (origDistinct(midis) < origDistinct(base)) continue
+          if (strict(midis)) {
+            cl[i].midi += d
+            done = true
+            break outer
+          }
+        }
+      }
+    }
+  }
+  return out
 }

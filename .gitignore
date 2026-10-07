@@ -5,3 +5,4 @@ public/vendor/
 *.cjs
 *.log
 .eval/
+eval/real-clips*.json

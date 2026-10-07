@@ -123,7 +123,14 @@ function makeTone(midi: number, seed: number): Float32Array {
   ok(eWith < eNo * 0.75, `居中内容被中置抑制压低(RMS ${eWith.toFixed(4)} vs ${eNo.toFixed(4)},<0.75×)`)
 }
 
-// ---- 5) 低频切除:纯低频成分不应出现在吉他轨 ----
+// ---- 5) 低频切除:低频成分主要归到 bass 轨 ----
+//
+// 注意这里的阈值是**实测权衡后的契约**,不是"越低越好":
+// 掩码的频率分辨率是 10.8Hz(22050/2048),而贝斯基频 50Hz 与吉他 6 弦 D2 73.4Hz
+// 只隔约 2 个 bin。要把 50Hz 压到 0.1× 以下,过渡带就必须吃掉 64.6Hz 那个 bin,
+// 而 D2/E2 的能量正落在 64.6~86Hz 上 —— 实测会再削掉 D2 约 10%。
+// 而 <70Hz 的内容本来就被两个引擎切掉(BP 的 constrainFrequency minHz=70、YIN fmin=70),
+// 所以这里选择"压到 0.2× 左右、但不碰吉他最低两根弦"(见 5b)。
 {
   const low = new Float32Array(total)
   for (let i = 0; i < total; i++) low[i] = Math.sin((2 * Math.PI * 50 * i) / SR) * 0.5
@@ -131,7 +138,31 @@ function makeTone(midi: number, seed: number): Float32Array {
   const eG = rmsMid(stems.guitar[0])
   const eB = rmsMid(stems.bass[0])
   const eIn = rmsMid(low)
-  ok(eG < eIn * 0.1 && eB > eIn * 0.9, `50Hz 成分留在 bass 轨:guitar ${(eG / eIn).toFixed(3)}× 输入, bass ${(eB / eIn).toFixed(3)}×`)
+  ok(eG < eIn * 0.3 && eB > eIn * 0.9, `50Hz 主要归到 bass 轨:guitar ${(eG / eIn).toFixed(3)}× 输入, bass ${(eB / eIn).toFixed(3)}×`)
+}
+
+// ---- 5b) 低频切除不能伤到吉他最低两根弦的基频(D2 73.4Hz / E2 82.4Hz) ----
+// 旧实现(lowCutHz×(0.6,1.6) = 42→112Hz 宽带阶跃)实测 D2 −7.4dB、E2 −4.3dB ——
+// 正好削在吉他最要紧的两个音上,而对 >110Hz 的贝斯谐波毫无作用(0.00dB)。
+{
+  const gainAt = (hz: number) => {
+    const x = new Float32Array(total)
+    for (let i = 0; i < total; i++) x[i] = Math.sin((2 * Math.PI * hz * i) / SR) * 0.5
+    const stems = separateDsp([x, x.slice()], SR, { centerSuppress: 0 })
+    const a = Math.floor(total * 0.2)
+    const b = Math.floor(total * 0.8)
+    let so = 0
+    let si = 0
+    for (let i = a; i < b; i++) {
+      so += stems.guitar[0][i] * stems.guitar[0][i]
+      si += x[i] * x[i]
+    }
+    return Math.sqrt(so / si)
+  }
+  const gD2 = gainAt(73.42)
+  const gE2 = gainAt(82.41)
+  ok(gD2 > 0.95, `Drop D 的 D2(73.4Hz)在吉他轨基本无损(增益 ${gD2.toFixed(3)} > 0.95,旧实现 0.43)`)
+  ok(gE2 > 0.98, `标准调弦 6 弦 E2(82.4Hz)在吉他轨基本无损(增益 ${gE2.toFixed(3)} > 0.98,旧实现 0.62)`)
 }
 
 // ---- 6) 空输入不崩 ----
