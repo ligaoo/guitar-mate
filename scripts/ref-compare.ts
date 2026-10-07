@@ -72,9 +72,14 @@ async function main() {
   await ensureBackend(true)
 
   // 待测参数组:产品现行各档 + 召回聚合;--ot/--ft 显式覆盖时再加一行自定义
+  // 预设行的标签从预设值生成:预设随寻优更新(如 sweep v2 把 mix 改成 ft0.60),写死的标签会和实际参数对不上
+  const presetTag = (id: 'mix' | 'dist') => {
+    const p = bpPreset(id)
+    return `ot${p.onsetThresh}/ft${p.frameThresh}/mnl${p.minNoteLenFrames}`
+  }
   const rows: Row[] = [
-    { id: 'mix-preset', desc: '产品 mix 预设 ot0.55/ft0.40', ...bpPreset('mix') },
-    { id: 'dist-preset', desc: '失真路由 ot0.35/ft0.30(单帧双阈值)', ...bpPreset('dist'), recallExtract: false },
+    { id: 'mix-preset', desc: `产品 mix 预设 ${presetTag('mix')}`, ...bpPreset('mix') },
+    { id: 'dist-preset', desc: `失真路由 ${presetTag('dist')}(单帧双阈值)`, ...bpPreset('dist'), recallExtract: false },
     { id: 'relaxed', desc: '放宽 ot0.30/ft0.25/mnl6', onsetThresh: 0.3, frameThresh: 0.25, minNoteLenFrames: 6, melodiaTrick: false, recallExtract: false },
     { id: 'recall-agg', desc: '召回聚合提取(产品默认:八度过滤自动关)', ...bpPreset('dist') },
     // 消融:八度重影过滤在本曲上 −2.4pt(删掉和弦内真实八度叠音,占节奏参考音 35%);

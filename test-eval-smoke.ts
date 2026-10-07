@@ -15,15 +15,27 @@ const ok = (cond: boolean, msg: string) => {
 }
 
 // ---- 1. WAV 往返:真实音频样例的加载路径与此等价 ----
+// 16 位有符号整数不对称(−32768..32767):×32768 定标下 [−1, 32767/32768] 内取整误差 ≤0.5 LSB,
+// 而 (32767.5/32768, 1] 会被钳到 32767,误差最多 1 LSB——这是格式本身的性质,不是编码 bug。
+// 旧版用 Math.random() 取满 [−1,1),约 5% 的运行会抽到钳位区而失败(CI 实测 0.82 LSB;模拟 2000 次失败 100 次)。
 {
+  let seed = 0x9e3779b9
+  const rnd = () => {
+    seed = (Math.imul(seed ^ (seed >>> 15), 0x2c1b3c6d) + 0x6d2b79f5) >>> 0
+    return seed / 4294967296
+  }
   const ch = new Float32Array(8192)
-  for (let i = 0; i < ch.length; i++) ch[i] = Math.random() * 2 - 1
+  for (let i = 0; i < ch.length; i++) ch[i] = -1 + rnd() * (1 + 32767 / 32768)
+  ch[0] = -1
+  ch[1] = 32767 / 32768
   const wav = encodeWav([ch], 22050)
   const dec = decodeWav(wav)
   let maxErr = 0
   for (let i = 0; i < ch.length; i++) maxErr = Math.max(maxErr, Math.abs(dec.channels[0][i] - ch[i]))
   ok(dec.sampleRate === 22050 && dec.channels.length === 1, `WAV 头:SR ${dec.sampleRate} · ${dec.channels.length} 声道`)
-  ok(maxErr <= 0.6 / 32768, `16 位量化往返最大误差 ${(maxErr * 32768).toFixed(2)} LSB ≤ 0.6`)
+  ok(maxErr <= 0.5 / 32768 + 1e-9, `16 位量化往返最大误差 ${(maxErr * 32768).toFixed(2)} LSB ≤ 0.5(可表示范围内)`)
+  const full = decodeWav(encodeWav([new Float32Array([1, -1])], 22050)).channels[0]
+  ok(full[0] === 32767 / 32768 && full[1] === -1, '满幅 +1.0 钳到 32767、−1.0 精确往返(int16 不对称)')
 }
 
 // ---- 2. 指标 ----
